@@ -48,6 +48,21 @@ uv run solidworks-mcp
 
 See `docs/mcp-client-config.md` for MCP client examples.
 
+## Protocol catalog
+
+The executable MCP tool surface intentionally stays small.  Future SolidWorks
+abilities are documented through read-only discovery interfaces instead of
+placeholder tools:
+
+- `solidworks://capabilities`
+- `solidworks://capabilities/{category}`
+- prompt `plan_solidworks_operation`
+
+See `docs/protocol-catalog.md` for the human-readable catalog covering sketch,
+part modeling, drawing, export, assembly, properties, templates/macros and
+diagnostics.  Capabilities marked `planned`, `research` or `blocked` are for
+design discussion only and must not be submitted to `execute_model_plan`.
+
 ## Model plan
 
 Modeling input is a restricted JSON operation list.  See

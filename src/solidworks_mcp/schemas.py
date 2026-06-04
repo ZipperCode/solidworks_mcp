@@ -39,7 +39,14 @@ class PlanValidationError(ValueError):
 
 @dataclass(frozen=True)
 class DrawingProfile:
-    """Engineering drawing settings requested by a model plan."""
+    """Engineering drawing protocol block requested by a model plan.
+
+    ``DrawingProfile`` describes the drawing deliverables the AI wants after
+    modeling, such as sheet format, projection style, default views and drawing
+    export formats.  It is deliberately small so the adapter can choose stable
+    SolidWorks API calls and report partial annotation failures without changing
+    the main model execution contract.
+    """
 
     enabled: bool = True
     template_path: str | None = None
@@ -96,7 +103,13 @@ class DrawingProfile:
 
 @dataclass(frozen=True)
 class ModelOperation:
-    """One whitelisted modeling operation in execution order."""
+    """One executable modeling operation in execution order.
+
+    The operation name must be present in ``SUPPORTED_OPERATIONS``.  Capability
+    catalog entries marked ``planned``, ``research`` or ``blocked`` are protocol
+    notes only and must not appear here until schema validation and adapter
+    execution are both implemented.
+    """
 
     op: str
     parameters: dict[str, Any] = field(default_factory=dict)
@@ -141,7 +154,14 @@ class ModelOperation:
 
 @dataclass(frozen=True)
 class ModelPlan:
-    """A complete, reviewable CAD plan that can be validated before execution."""
+    """A complete, reviewable CAD protocol payload for AI-assisted modeling.
+
+    MCP clients should create a ``ModelPlan`` after discussing the design with
+    the user, then call ``validate_model_plan`` before asking for confirmation.
+    The plan keeps high-level CAD intent in JSON while SolidWorks COM details,
+    semantic selection, fallback behavior and debug artifacts remain inside the
+    executor and adapter layers.
+    """
 
     name: str
     units: str
@@ -234,7 +254,14 @@ class StepResult:
 
 @dataclass(frozen=True)
 class ExecutionReport:
-    """Structured feedback package returned after validation or execution."""
+    """Structured feedback package returned after validation or execution.
+
+    The report is the main MCP response contract for review and bug location.
+    Confirmed executions include run identifiers, artifact paths, step results,
+    preview/export files, failure class, repro command and diagnostics so a
+    later Windows SolidWorks test can be diagnosed without replaying the whole
+    conversation.
+    """
 
     ok: bool
     adapter: str

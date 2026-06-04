@@ -2,6 +2,20 @@
 
 This server uses stdio transport through the official Python MCP SDK.
 
+## Discovery surfaces
+
+The server keeps the executable tool surface limited to the six high-level
+tools, but also exposes read-only planning helpers:
+
+- resource `solidworks://capabilities`
+- resource `solidworks://capabilities/{category}`
+- prompt `plan_solidworks_operation`
+
+Use these discovery surfaces to decide whether a requested SolidWorks ability is
+currently executable, planned, research-only or blocked.  Only executable
+operations accepted by `validate_model_plan` should be submitted to
+`execute_model_plan`.
+
 ## Local mock mode
 
 Use mock mode on macOS or Linux while developing prompts, schemas and client
