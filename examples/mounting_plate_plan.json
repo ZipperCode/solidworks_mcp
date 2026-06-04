@@ -1,0 +1,43 @@
+{
+  "name": "m6_mounting_plate",
+  "units": "mm",
+  "metadata": {
+    "description": "Smoke-test mounting plate: 120 x 80 x 10 mm, R5 corners, four M6 ISO metric coarse threaded through holes."
+  },
+  "output_formats": ["sldprt", "step", "stl"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "operations": [
+    {
+      "id": "mounting_plate",
+      "op": "create_mounting_plate",
+      "description": "Create the default M6 mounting plate smoke-test part.",
+      "parameters": {
+        "length": 120,
+        "width": 80,
+        "thickness": 10,
+        "corner_radius": 5,
+        "edge_offset": 15,
+        "thread_spec": "M6",
+        "thread_standard": "ISO_metric_coarse",
+        "hole_pattern": {
+          "type": "four_corner",
+          "target_face": "top_face"
+        }
+      }
+    },
+    {
+      "id": "drawing",
+      "op": "make_drawing",
+      "description": "Generate the default drawing views and attempt hole/thread callouts.",
+      "parameters": {}
+    }
+  ]
+}
+

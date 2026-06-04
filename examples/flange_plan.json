@@ -1,0 +1,81 @@
+{
+  "name": "center_hole_flange",
+  "units": "mm",
+  "metadata": {
+    "description": "A simple cylindrical flange with a center through hole."
+  },
+  "output_formats": ["sldprt", "step", "stl"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "operations": [
+    {
+      "id": "base_sketch",
+      "op": "create_sketch",
+      "description": "Create the outer flange circle.",
+      "parameters": {
+        "plane": "front",
+        "entities": [
+          {
+            "type": "circle",
+            "center": [0, 0],
+            "radius": 50
+          }
+        ]
+      }
+    },
+    {
+      "id": "base_extrude",
+      "op": "extrude",
+      "description": "Extrude the flange body.",
+      "parameters": {
+        "sketch_id": "base_sketch",
+        "depth": 12
+      }
+    },
+    {
+      "id": "center_hole_sketch",
+      "op": "create_sketch",
+      "description": "Create the center hole profile.",
+      "parameters": {
+        "plane": "front",
+        "entities": [
+          {
+            "type": "circle",
+            "center": [0, 0],
+            "radius": 12
+          }
+        ]
+      }
+    },
+    {
+      "id": "center_cut",
+      "op": "cut",
+      "description": "Cut the center through hole.",
+      "parameters": {
+        "sketch_id": "center_hole_sketch",
+        "depth": 20
+      }
+    },
+    {
+      "id": "material",
+      "op": "assign_material",
+      "description": "Assign a common steel material.",
+      "parameters": {
+        "material": "Plain Carbon Steel"
+      }
+    },
+    {
+      "id": "drawing",
+      "op": "make_drawing",
+      "description": "Request the default engineering drawing output.",
+      "parameters": {}
+    }
+  ]
+}
+

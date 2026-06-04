@@ -1,0 +1,30 @@
+[project]
+name = "solidworks-mcp"
+version = "0.1.0"
+description = "A minimal Python MCP server for AI-assisted SolidWorks modeling workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "ZipperCode" }
+]
+dependencies = [
+  "mcp>=1.12.4"
+]
+
+[project.optional-dependencies]
+windows = [
+  "comtypes>=1.4.10",
+  "pywin32>=306"
+]
+
+[project.scripts]
+solidworks-mcp = "solidworks_mcp.server:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/solidworks_mcp"]
+
