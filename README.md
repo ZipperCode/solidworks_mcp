@@ -27,6 +27,60 @@ simulation validation or 2D drawing-to-3D reconstruction in the current release.
 The static-simulation scenario is explicit-only until a real SolidWorks
 Simulation/CosmosWorks API is available and accepted by the production gate.
 
+## 中文生产说明
+
+当前主分支的定位是“受控件库 + 原子建模会话 + 生产级诊断门禁”的
+SolidWorks MCP。AI agent 可以先做规划、预检、诊断和修复建议；真正创建
+SolidWorks 文档前，仍必须由调用方提交 `confirmed=true`。
+
+当前默认生产门禁覆盖 25 个场景：安装板、法兰、中心孔板、支架、端盖、
+安装块、轴、垫片、套筒、开槽/孔阵列板、装配/BOM、钣金基体法兰、
+焊件框架，以及原子建模的拉伸、切除、孔、倒圆、倒角、线性/圆周阵列、
+旋转、扫描、放样等能力。仿真场景仍为显式运行，不进入默认生产验收。
+
+导入已有 `SLDPRT` 后生成生产加工图时，使用 `import_existing_model` +
+`make_drawing`，并在 `drawing_profile` 中设置：
+
+```json
+{
+  "enabled": true,
+  "sheet_format": "A3",
+  "projection": "first_angle",
+  "view_style": "manufacturing_rotational",
+  "include_isometric": true,
+  "include_basic_dimensions": true,
+  "export_formats": ["pdf", "dwg"]
+}
+```
+
+该路径会把源模型复制到隔离的 `run_dir`，只生成新的零件和工程图文件，不会
+原地修改用户文件。生产验收要求真实 SolidWorks 剖视图
+`CreateSectionViewAt5` 证据、主剖视图、端视图、等轴测参考图、OD/ID/L
+三类几何可验证 display dimensions、中心线/中心标记、A3 第一角法布局、
+PDF/DWG/SLDDRW 导出，以及“导入模型尺寸/材料/表面处理需人工确认”的可见
+技术说明。导入模型不会伪造完整加工尺寸；未能从模型或用户输入确认的信息会
+明确标记为 `<未指定>` 或需人工确认。
+
+常用中文验收命令：
+
+```powershell
+python scripts\check_existing_model_manufacturing_drawing_gate.py
+python scripts\smoke_mounting_plate.py --plan <existing-model-plan.json> --summary-only
+python scripts\diagnose_run.py <run_dir> --summary-only
+python scripts\release_production_gate.py --mock --summary-only
+python scripts\diagnose_release_gate.py <release_gate_report.json> --summary-only
+```
+
+真实 SolidWorks 生产执行建议开启：
+
+```powershell
+$env:SOLIDWORKS_MCP_ADAPTER = "solidworks"
+$env:SOLIDWORKS_MCP_CLOSE_DOCUMENTS_AFTER_RUN = "1"
+$env:SOLIDWORKS_MCP_CLEANUP_ATTACH_ONLY = "1"
+$env:SOLIDWORKS_MCP_ENFORCE_TRUSTED_WORKFLOW = "1"
+$env:SOLIDWORKS_MCP_REQUIRE_DIRECT_HOLE_CALLOUT = "1"
+```
+
 ## Install
 
 ```bash
@@ -85,15 +139,20 @@ Supported MVP operation names:
 - `create_end_cap`
 - `create_mounting_block`
 - `create_shaft`
+- `create_sheet_metal_base_flange`
 - `create_washer`
 - `create_sleeve`
 - `create_slotted_array_plate`
+- `create_weldment_frame`
+- `create_bom_assembly`
+- `create_plane`
 - `create_sketch`
 - `extrude`
 - `cut`
 - `hole`
 - `fillet`
 - `chamfer`
+- `import_existing_model`
 - `linear_pattern`
 - `circular_pattern`
 - `revolve`
@@ -102,14 +161,18 @@ Supported MVP operation names:
 - `assign_material`
 - `set_custom_properties`
 - `make_drawing`
+- `run_static_simulation`
 
 Some operations are schema-supported before full Windows COM implementation so
 the plan contract can stay stable while adapter coverage grows.
 `create_mounting_plate`, `create_center_hole_flange`,
-`create_center_hole_plate`, `create_bracket`, `create_end_cap`, `create_mounting_block`, `create_shaft`, `create_washer`, `create_sleeve`, and `create_slotted_array_plate` are the
-current controlled production workflows.
-Other schema-supported lower-level operations remain development capabilities
-until they receive their own trusted gates.
+`create_center_hole_plate`, `create_bracket`, `create_end_cap`,
+`create_mounting_block`, `create_shaft`, `create_sheet_metal_base_flange`,
+`create_weldment_frame`, `create_washer`, `create_sleeve`,
+`create_slotted_array_plate`, `create_bom_assembly`, `import_existing_model`,
+and the gated atomic modeling scenarios are the current controlled production
+workflows. `run_static_simulation` remains explicit-only and is excluded from the
+default release gate.
 
 ## Mounting plate smoke workflow
 
@@ -142,9 +205,10 @@ The production suite runs independent trusted scenarios for the baseline plate,
 localized material alias verification, custom properties/PDF metadata, a
 combined metadata gate, optional DXF drawing exchange export, optional
 IGES/Parasolid neutral exports, a wide controlled-size combined gate, the
-baseline center-hole flange workflow, and the baseline center-hole plate
-workflow, plus the baseline bracket, end-cap, mounting-block, shaft, washer and
-sleeve workflows.  Each smoke run also calls the offline
+baseline center-hole flange workflow, center-hole plate workflow, bracket,
+end-cap, mounting-block, shaft, sheet-metal base flange, weldment frame, washer,
+sleeve, slotted-array plate, BOM assembly, and gated atomic modeling workflows.
+Each smoke run also calls the offline
 `diagnose_run` verifier against the generated `run_dir`; suite acceptance
 requires both the execution production verdict and offline artifact/manifest
 integrity to pass.  Limit it to one scenario when iterating against a real
@@ -170,8 +234,12 @@ dedicated output root, executes the full trusted production scenario set
 (`baseline`, `material_alias`, `custom_properties`, `combined`,
 `drawing_exchange`, `neutral_exports`, `wide_combined`, `flange_baseline`,
 `center_hole_plate_baseline`, `bracket_baseline`, `end_cap_baseline`,
-`mounting_block_baseline`, `shaft_baseline`, `washer_baseline`, and
-`sleeve_baseline`, `slotted_array_plate_baseline`) and then batch diagnoses only that root with an
+`mounting_block_baseline`, `shaft_baseline`,
+`sheet_metal_base_flange_baseline`, `weldment_frame_baseline`,
+`washer_baseline`, `sleeve_baseline`, `slotted_array_plate_baseline`,
+`bom_assembly_baseline`, `atomic_baseline`, `atomic_cut_baseline`,
+`atomic_pattern_baseline`, `atomic_revolve_baseline`,
+`atomic_sweep_baseline`, and `atomic_loft_baseline`) and then batch diagnoses only that root with an
 unbounded scan.  The gate writes
 `release_gate_report.json` at the gate output root so the batch verdict can be
 archived without relying on terminal scrollback.  The report includes top-level
