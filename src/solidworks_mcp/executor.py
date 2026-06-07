@@ -1180,6 +1180,30 @@ def _build_existing_model_production_acceptance_result(
     section_view = _as_dict(manufacturing_draft.get("section_view"))
     centerline = _as_dict(manufacturing_draft.get("centerline"))
     center_mark = _as_dict(manufacturing_draft.get("center_mark"))
+    if trusted_workflow.get("document_type") == "assembly":
+        return _build_existing_model_assembly_acceptance_result(
+            plan,
+            execution_ok,
+            diagnostics,
+            output_files,
+            preview_files,
+            trusted_workflow,
+            drawing_view_result,
+            dimension_result,
+            artifact_result,
+            content_result,
+            cad_content_result,
+            pdf_semantic_result,
+            cleanup_result,
+            custom_property_result,
+            material_result,
+            geometry_result,
+            export_result,
+            import_result,
+            metadata_note_result,
+            manufacturing_note_result,
+            document_state_audit,
+        )
     required_material = _required_material_from_plan(plan)
     required_custom_properties = _required_custom_properties_from_plan(plan)
     output_keys = set(output_files)
@@ -1192,13 +1216,16 @@ def _build_existing_model_production_acceptance_result(
     missing_drawing_view_roles = sorted(required_view_roles - drawing_view_roles)
     native_output = "sldasm" if trusted_workflow.get("document_type") == "assembly" else "sldprt"
     required_output_keys = {native_output, "slddrw", "pdf", "dwg"}
-    required_dimensions = {"overall_outer_diameter", "inner_diameter", "overall_length"}
     created_dimension_items = [
         item
         for item in dimension_result.get("created_dimensions", [])
         if isinstance(item, dict) and item.get("id")
     ]
     created_dimensions = {str(item.get("id")) for item in created_dimension_items}
+    required_dimensions = _existing_model_required_dimensions_for_acceptance(
+        dimension_result,
+        manufacturing_draft,
+    )
     missing_dimensions = sorted(required_dimensions - created_dimensions)
     display_dimension_count = _positive_int(dimension_result.get("display_dimension_count"))
     geometry_verified_dimension_count = _positive_int(
@@ -1236,7 +1263,8 @@ def _build_existing_model_production_acceptance_result(
         and import_result.get("copied_to_run_dir") is True,
         "manufacturing_draft_created": manufacturing_draft.get("status")
         == "existing_model_manufacturing_draft_created"
-        and manufacturing_draft.get("classification") == "imported_rotational_machining_draft",
+        and manufacturing_draft.get("classification")
+        in {"imported_rotational_machining_draft", "imported_prismatic_machining_draft"},
         "gb_first_angle_layout": layout_result.get("layout_style") == "manufacturing_rotational"
         and layout_result.get("projection") == "first_angle",
         "manufacturing_views_created": diagnostics.get("drawing_view_status") == "created"
@@ -1244,12 +1272,23 @@ def _build_existing_model_production_acceptance_result(
         and not missing_drawing_view_roles,
         "drawing_views_not_clipped": layout_result.get("status") == "layout_verified"
         and layout_result.get("clipped_view_count") == 0,
-        "rotational_axis_verified": rotational_axis.get("status") == "axis_verified"
-        and _positive_number(rotational_axis.get("confidence"))
-        and float(rotational_axis.get("confidence") or 0.0) >= 0.70,
+        "rotational_axis_verified": (
+            manufacturing_draft.get("classification") == "imported_prismatic_machining_draft"
+            and rotational_axis.get("status") == "not_required"
+        )
+        or (
+            rotational_axis.get("status") == "axis_verified"
+            and _positive_number(rotational_axis.get("confidence"))
+            and float(rotational_axis.get("confidence") or 0.0) >= 0.70
+        ),
         "section_view_created": section_view.get("status") == "section_view_created"
         and section_object_verified,
-        "centerline_created": centerline_created,
+        "centerline_created": (
+            manufacturing_draft.get("classification") == "imported_prismatic_machining_draft"
+            and centerline.get("status") == "not_required"
+            and center_mark.get("status") == "not_required"
+        )
+        or centerline_created,
         "imported_model_uncertainty_note_created": manufacturing_note_created,
         "basic_dimensions_created": diagnostics.get("drawing_dimension_status") == "basic_dimensions_created"
         and not missing_dimensions
@@ -1376,9 +1415,9 @@ def _build_existing_model_production_acceptance_result(
             "drawing_layout_projection": "first_angle",
             "drawing_layout_status": "layout_verified",
             "drawing_layout_clipped_view_count": 0,
-            "rotational_axis_status": "axis_verified",
+            "rotational_axis_status": "axis_verified unless imported_prismatic_machining_draft",
             "section_view_status": "section_view_created",
-            "centerline_status": "centerline_created",
+            "centerline_status": "centerline_created unless imported_prismatic_machining_draft",
             "drawing_dimension_status": "basic_dimensions_created",
             "required_dimensions": sorted(required_dimensions),
             "dimension_layout_status": "existing_model_manufacturing_dimensions_created",
@@ -1392,6 +1431,243 @@ def _build_existing_model_production_acceptance_result(
             "cleanup_verification_status": "verified unless no documents were created",
         },
     }
+
+
+def _build_existing_model_assembly_acceptance_result(
+    plan: ModelPlan,
+    execution_ok: bool,
+    diagnostics: dict[str, Any],
+    output_files: dict[str, str],
+    preview_files: dict[str, str],
+    trusted_workflow: dict[str, Any],
+    drawing_view_result: dict[str, Any],
+    dimension_result: dict[str, Any],
+    artifact_result: dict[str, Any],
+    content_result: dict[str, Any],
+    cad_content_result: dict[str, Any],
+    pdf_semantic_result: dict[str, Any],
+    cleanup_result: dict[str, Any],
+    custom_property_result: dict[str, Any],
+    material_result: dict[str, Any],
+    geometry_result: dict[str, Any],
+    export_result: dict[str, Any],
+    import_result: dict[str, Any],
+    metadata_note_result: dict[str, Any],
+    manufacturing_note_result: dict[str, Any],
+    document_state_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a production verdict for imported existing assembly drawings."""
+
+    required_material = _required_material_from_plan(plan)
+    required_custom_properties = _required_custom_properties_from_plan(plan)
+    output_keys = set(output_files)
+    preview_keys = set(preview_files)
+    requested_output_keys = set(_combined_export_formats(plan))
+    missing_requested_output_keys = sorted(requested_output_keys - output_keys)
+    failed_exports = [item for item in export_result.get("failed", []) if isinstance(item, dict)]
+    drawing_view_roles = _drawing_view_roles(drawing_view_result)
+    required_view_roles = {"front", "top", "right", "isometric"}
+    missing_drawing_view_roles = sorted(required_view_roles - drawing_view_roles)
+    required_output_keys = {"sldasm", "slddrw", "pdf", "dwg"}
+    created_dimension_items = [
+        item
+        for item in dimension_result.get("created_dimensions", [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    created_dimensions = {str(item.get("id")) for item in created_dimension_items}
+    required_dimensions = {
+        str(item)
+        for item in dimension_result.get("required_dimensions", []) or []
+        if item
+    } or {"overall_length", "overall_width", "overall_height"}
+    missing_dimensions = sorted(required_dimensions - created_dimensions)
+    display_dimension_count = _positive_int(dimension_result.get("display_dimension_count"))
+    required_display_dimension_count = min(2, len(required_dimensions))
+    geometry_verified_dimension_count = _positive_int(
+        dimension_result.get("geometry_verified_dimension_count")
+    )
+    if geometry_verified_dimension_count == 0:
+        geometry_verified_dimension_count = sum(
+            1
+            for item in created_dimension_items
+            if item.get("classification") == "geometry_verified_dimension"
+            and item.get("proxy_dimension") is not True
+        )
+    layout_result = _as_dict(drawing_view_result.get("layout"))
+    assembly_resolution = _as_dict(import_result.get("assembly_resolution"))
+    active_component_count = _positive_int(assembly_resolution.get("active_component_count"))
+    component_count = _positive_int(assembly_resolution.get("component_count"))
+    missing_path_count = int(assembly_resolution.get("missing_path_count") or 0)
+    suppressed_component_count = int(assembly_resolution.get("suppressed_component_count") or 0)
+    manufacturing_note_created = (
+        metadata_note_result.get("status") == "manufacturing_note_created"
+        and manufacturing_note_result.get("status") == "manufacturing_note_created"
+        and _manufacturing_note_has_imported_model_uncertainty_evidence(manufacturing_note_result)
+    )
+    checks = {
+        "execution_ok": bool(execution_ok),
+        "trusted_controlled_workflow": trusted_workflow["ok"],
+        "preflight_ready": diagnostics.get("preflight_status") == "ready",
+        "existing_model_imported": import_result.get("status") == "existing_model_imported"
+        and import_result.get("copied_to_run_dir") is True,
+        "assembly_components_resolved": assembly_resolution.get("status") == "assembly_components_resolved"
+        and component_count >= 1
+        and active_component_count >= 1
+        and missing_path_count == 0
+        and suppressed_component_count < component_count,
+        "gb_first_angle_layout": layout_result.get("layout_style") == "existing_model_assembly"
+        and layout_result.get("projection") == "first_angle",
+        "assembly_views_created": diagnostics.get("drawing_view_status") == "created"
+        and drawing_view_result.get("status") == "created"
+        and not missing_drawing_view_roles,
+        "drawing_views_not_clipped": layout_result.get("status") == "layout_verified"
+        and layout_result.get("clipped_view_count") == 0,
+        "imported_model_uncertainty_note_created": manufacturing_note_created,
+        "basic_dimensions_created": diagnostics.get("drawing_dimension_status") == "basic_dimensions_created"
+        and not missing_dimensions
+        and int(dimension_result.get("created_dimension_count") or 0) >= len(required_dimensions)
+        and display_dimension_count >= required_display_dimension_count,
+        "assembly_dimensions_created": dimension_result.get("dimension_layout_status")
+        == "existing_model_assembly_dimensions_created"
+        and geometry_verified_dimension_count >= len(required_dimensions),
+        "trusted_basic_dimensions": dimension_result.get("dimension_layout_status")
+        == "existing_model_assembly_dimensions_created"
+        and display_dimension_count >= required_display_dimension_count
+        and geometry_verified_dimension_count >= len(required_dimensions),
+        "material_verified": required_material is None
+        or (
+            diagnostics.get("material_status") == "material_verified"
+            and _material_result_matches(material_result, required_material)
+        ),
+        "custom_properties_verified": not required_custom_properties
+        or (
+            diagnostics.get("custom_property_status") == "custom_properties_verified"
+            and _custom_property_result_matches(custom_property_result, required_custom_properties)
+        ),
+        "model_geometry_verified": diagnostics.get("model_geometry_status") == "geometry_verified"
+        and geometry_result.get("status") == "geometry_verified"
+        and int(geometry_result.get("body_count") or component_count or 0) >= 1,
+        "artifacts_ready": artifact_result.get("ok") is True
+        and artifact_result.get("status") == "artifacts_ready",
+        "artifact_content_ready": content_result.get("ok") is True
+        and content_result.get("status") in {"content_ready", "mock_preview_placeholders", "mock_output_placeholders"},
+        "cad_artifact_content": cad_content_result.get("ok") is True
+        and cad_content_result.get("status") in {"cad_artifacts_verified", "mock_placeholder"},
+        "drawing_pdf_semantic_content": pdf_semantic_result.get("ok") is True
+        and pdf_semantic_result.get("status") in {"pdf_semantic_content_verified", "mock_placeholder"},
+        "required_output_files": required_output_keys.issubset(output_keys),
+        "requested_output_files": not missing_requested_output_keys and not failed_exports,
+        "required_preview_files": required_view_roles.issubset(preview_keys),
+        "cleanup_completed": cleanup_result.get("enabled") is True
+        and cleanup_result.get("status") in {"completed", "skipped_no_documents"},
+        "cleanup_verified": cleanup_result.get("status") == "skipped_no_documents"
+        or cleanup_result.get("cleanup_verification_status") == "verified",
+        "document_state_audit_verified": document_state_audit.get("status")
+        == "verified_no_run_documents_open"
+        and document_state_audit.get("after_cleanup_run_created_open_count") == 0,
+    }
+    failures = [name for name, ok in checks.items() if not ok]
+    summary = {
+        "trusted_workflow_status": trusted_workflow["status"],
+        "trusted_workflow": trusted_workflow,
+        "existing_model_status": import_result.get("status"),
+        "existing_model_source_path": import_result.get("source_path"),
+        "existing_model_run_path": import_result.get("run_model_path"),
+        "existing_model_document_type": import_result.get("document_type"),
+        "assembly_resolution_status": assembly_resolution.get("status"),
+        "assembly_component_count": component_count,
+        "assembly_active_component_count": active_component_count,
+        "assembly_missing_path_count": missing_path_count,
+        "assembly_suppressed_component_count": suppressed_component_count,
+        "reference_copy_status": _as_dict(import_result.get("reference_copy_result")).get("status"),
+        "reference_copy_count": _as_dict(import_result.get("reference_copy_result")).get("copied_count"),
+        "drawing_view_status": diagnostics.get("drawing_view_status"),
+        "drawing_view_roles": sorted(drawing_view_roles),
+        "missing_drawing_view_roles": missing_drawing_view_roles,
+        "drawing_layout_status": layout_result.get("status"),
+        "drawing_layout_style": layout_result.get("layout_style"),
+        "drawing_layout_projection": layout_result.get("projection"),
+        "drawing_layout_scale": layout_result.get("scale"),
+        "drawing_layout_clipped_view_count": layout_result.get("clipped_view_count"),
+        "drawing_layout_sheet_size_m": layout_result.get("sheet_size_m"),
+        "dimension_count": dimension_result.get("created_dimension_count"),
+        "display_dimension_count": dimension_result.get("display_dimension_count"),
+        "geometry_verified_dimension_count": geometry_verified_dimension_count,
+        "dimension_layout_status": dimension_result.get("dimension_layout_status"),
+        "missing_dimensions": missing_dimensions,
+        "required_dimensions": sorted(required_dimensions),
+        "manufacturing_note_status": manufacturing_note_result.get("status"),
+        "manufacturing_note_method": manufacturing_note_result.get("method"),
+        "model_geometry_status": diagnostics.get("model_geometry_status"),
+        "model_geometry_body_count": geometry_result.get("body_count"),
+        "model_geometry_measured_dimensions_mm": geometry_result.get("measured_dimensions_mm"),
+        "mass_property_status": "not_required_for_imported_assembly",
+        "material_status": diagnostics.get("material_status"),
+        "custom_property_status": diagnostics.get("custom_property_status"),
+        "artifact_validation_status": artifact_result.get("status"),
+        "artifact_content_status": content_result.get("status"),
+        "cad_content_status": cad_content_result.get("status"),
+        "pdf_semantic_content_status": pdf_semantic_result.get("status"),
+        "export_status": export_result.get("status"),
+        "export_failed": failed_exports,
+        "missing_requested_output_files": missing_requested_output_keys,
+        "cleanup_status": cleanup_result.get("status"),
+        "cleanup_verification_status": cleanup_result.get("cleanup_verification_status"),
+        "document_state_audit_status": document_state_audit.get("status"),
+        "document_state_after_cleanup_run_created_open_count": document_state_audit.get(
+            "after_cleanup_run_created_open_count"
+        ),
+        "output_files": sorted(output_keys),
+        "preview_files": sorted(preview_keys),
+    }
+    return {
+        "status": "accepted" if not failures else "rejected",
+        "ok": not failures,
+        "checks": checks,
+        "failures": failures,
+        "repair_actions": build_repair_actions(failures, summary),
+        "summary": summary,
+        "expected": {
+            "trusted_workflow": trusted_workflow.get("status"),
+            "existing_model_status": "existing_model_imported",
+            "assembly_resolution_status": "assembly_components_resolved",
+            "drawing_view_status": "created",
+            "required_drawing_view_roles": sorted(required_view_roles),
+            "drawing_layout_style": "existing_model_assembly",
+            "drawing_layout_projection": "first_angle",
+            "drawing_layout_status": "layout_verified",
+            "drawing_layout_clipped_view_count": 0,
+            "drawing_dimension_status": "basic_dimensions_created",
+            "required_dimensions": sorted(required_dimensions),
+            "dimension_layout_status": "existing_model_assembly_dimensions_created",
+            "manufacturing_note_status": "manufacturing_note_created",
+            "model_geometry_status": "geometry_verified",
+            "mass_property_status": "not_required_for_imported_assembly",
+            "required_output_files": sorted(required_output_keys),
+            "requested_output_files": sorted(requested_output_keys),
+            "required_preview_files": sorted(required_view_roles),
+            "cleanup_status": ["completed", "skipped_no_documents"],
+            "cleanup_verification_status": "verified unless no documents were created",
+        },
+    }
+
+
+def _existing_model_required_dimensions_for_acceptance(
+    dimension_result: dict[str, Any],
+    manufacturing_draft: dict[str, Any],
+) -> set[str]:
+    """Return required imported-model dimension ids for the detected draft class."""
+
+    required = {
+        str(item)
+        for item in dimension_result.get("required_dimensions", []) or []
+        if item
+    }
+    if required:
+        return required
+    if manufacturing_draft.get("classification") == "imported_prismatic_machining_draft":
+        return {"overall_length"}
+    return {"overall_outer_diameter", "inner_diameter", "overall_length"}
 
 
 def _build_atomic_production_acceptance_result(

@@ -17,7 +17,13 @@ if str(SRC) not in sys.path:
 
 from solidworks_mcp.executor import _build_production_acceptance_result
 from solidworks_mcp.run_diagnostics import _trusted_dimension_evidence_ok
-from solidworks_mcp.schemas import ModelPlan
+from solidworks_mcp.schemas import DrawingProfile, ModelPlan, existing_model_parameters_from_plan
+from solidworks_mcp.adapters import solidworks as solidworks_adapter
+from solidworks_mcp.adapters.solidworks import (
+    SolidWorksCOMAdapter,
+    _estimated_view_outline,
+    _outline_inside_safe_rect,
+)
 
 
 def main() -> None:
@@ -112,6 +118,9 @@ def main() -> None:
             "imported_model_uncertainty_note_created" in rejected_note.get("failures", []),
             f"Missing uncertainty-note gate failure: {rejected_note}",
         )
+        _assert_large_frame_layout_not_clipped(plan)
+        _assert_prismatic_imported_frame_accepted(source, plan)
+        _assert_imported_assembly_acceptance(source)
 
     print(
         {
@@ -120,6 +129,9 @@ def main() -> None:
                 "manufacturing_draft_accepted",
                 "missing_section_view_rejected",
                 "missing_uncertainty_note_rejected",
+                "large_frame_layout_scaled_to_fit",
+                "prismatic_imported_frame_accepted",
+                "imported_assembly_reference_paths_and_gate",
             ],
         }
     )
@@ -263,6 +275,289 @@ def _accepted_diagnostics(source: Path) -> dict:
             "after_cleanup_run_created_open_count": 0,
         },
     }
+
+
+def _assert_large_frame_layout_not_clipped(plan: ModelPlan) -> None:
+    adapter = object.__new__(SolidWorksCOMAdapter)
+    adapter._drawing = None
+    adapter._require_model = lambda: object()
+    old_reader = solidworks_adapter._read_model_bounding_box
+    solidworks_adapter._read_model_bounding_box = lambda model: {
+        "status": "read",
+        "body_count": 1,
+        "bbox_m": [0.0, 0.0, 0.0, 2.36, 1.43, 1.06],
+    }
+    try:
+        layout = SolidWorksCOMAdapter._build_existing_model_manufacturing_layout(
+            adapter,
+            plan,
+            DrawingProfile.from_dict(plan.drawing_profile.to_dict()),
+        )
+    finally:
+        solidworks_adapter._read_model_bounding_box = old_reader
+
+    safe_rect = layout["safe_rect_m"]
+    checks = []
+    for role in ("section", "end", "isometric"):
+        slot = layout["slots"][role]
+        scale = float(layout["isometric_scale"] if role == "isometric" else layout["scale"])
+        outline = _estimated_view_outline(slot, scale)
+        checks.append(
+            {
+                "role": role,
+                "scale": scale,
+                "outline": outline,
+                "inside_safe_rect": _outline_inside_safe_rect(outline, safe_rect),
+            }
+        )
+    _assert(
+        all(check["inside_safe_rect"] for check in checks),
+        f"Expected large imported frame layout to stay inside A3 safe rect: {checks}; layout={layout}",
+    )
+
+
+def _assert_prismatic_imported_frame_accepted(source: Path, plan: ModelPlan) -> None:
+    diagnostics = _accepted_diagnostics(source)
+    diagnostics["drawing_view_result"]["layout"]["model_dimensions_m"] = {"x": 2.36, "y": 1.43, "z": 1.06}
+    diagnostics["drawing_view_result"]["manufacturing_draft"] = {
+        **diagnostics["drawing_view_result"]["manufacturing_draft"],
+        "classification": "imported_prismatic_machining_draft",
+        "rotational_axis": {"status": "not_required", "reason": "non_rotational_imported_model"},
+        "centerline": {"status": "not_required", "reason": "non_rotational_imported_model"},
+        "center_mark": {"status": "not_required", "reason": "non_rotational_imported_model"},
+    }
+    diagnostics["drawing_dimension_status"] = "basic_dimensions_created"
+    diagnostics["drawing_dimension_result"] = {
+        "status": "basic_dimensions_created",
+        "required_dimensions": ["overall_length"],
+        "created_dimensions": [
+            {
+                "id": "overall_length",
+                "method": "AddVerticalDimension2",
+                "is_display_dimension": True,
+                "classification": "geometry_verified_dimension",
+                "proxy_dimension": False,
+            }
+        ],
+        "created_dimension_count": 1,
+        "missing_dimensions": [],
+        "display_dimension_count": 1,
+        "dimension_layout_status": "existing_model_manufacturing_dimensions_created",
+        "geometry_verified_dimension_count": 1,
+    }
+    verdict = _build_production_acceptance_result(
+        plan,
+        True,
+        diagnostics,
+        {
+            "sldprt": "model.SLDPRT",
+            "slddrw": "drawing.SLDDRW",
+            "pdf": "drawing.pdf",
+            "dwg": "drawing.dwg",
+        },
+        {
+            "section": "section.png",
+            "end": "end.png",
+            "isometric": "isometric.png",
+        },
+    )
+    _assert(verdict["ok"] is True, f"Expected prismatic imported frame verdict to pass: {verdict}")
+    summary = verdict.get("summary") or {}
+    _assert(
+        summary.get("required_dimensions") == ["overall_length"],
+        f"Expected prismatic frame to require only overall_length evidence: {summary}",
+    )
+
+
+def _assert_imported_assembly_acceptance(source: Path) -> None:
+    reference_dir = source.parent / "assembly_refs"
+    reference_dir.mkdir()
+    (reference_dir / "sample_component.SLDPRT").write_bytes(b"placeholder")
+    assembly = source.parent / "resolved_assembly.SLDASM"
+    assembly.write_bytes(b"placeholder")
+    plan = ModelPlan.from_dict(
+        {
+            "name": "resolved_assembly_existing_model_drawing",
+            "units": "mm",
+            "output_formats": ["sldasm", "pdf", "dwg"],
+            "operations": [
+                {
+                    "op": "import_existing_model",
+                    "parameters": {
+                        "path": os.fspath(assembly),
+                        "copy_to_run_dir": True,
+                        "document_type": "assembly",
+                        "reference_search_paths": [os.fspath(reference_dir)],
+                    },
+                },
+                {"op": "make_drawing", "parameters": {}},
+            ],
+            "drawing_profile": {
+                "enabled": True,
+                "sheet_format": "A3",
+                "projection": "first_angle",
+                "view_style": "assembly_general",
+                "include_isometric": True,
+                "include_basic_dimensions": True,
+                "export_formats": ["pdf", "dwg"],
+            },
+        }
+    )
+    params = existing_model_parameters_from_plan(plan)
+    _assert(params is not None, "Expected imported assembly parameters")
+    _assert(
+        params.get("reference_search_paths") == [os.fspath(reference_dir)],
+        f"Expected reference search paths to be preserved: {params}",
+    )
+    diagnostics = _accepted_assembly_diagnostics(assembly)
+    verdict = _build_production_acceptance_result(
+        plan,
+        True,
+        diagnostics,
+        {
+            "sldasm": "model.SLDASM",
+            "slddrw": "drawing.SLDDRW",
+            "pdf": "drawing.pdf",
+            "dwg": "drawing.dwg",
+        },
+        {
+            "front": "front.png",
+            "top": "top.png",
+            "right": "right.png",
+            "isometric": "isometric.png",
+        },
+    )
+    _assert(verdict["ok"] is True, f"Expected resolved imported assembly verdict to pass: {verdict}")
+    summary = verdict.get("summary") or {}
+    _assert(
+        summary.get("required_dimensions") == ["overall_height", "overall_length", "overall_width"],
+        f"Expected imported assembly to require overall L/W/H evidence: {summary}",
+    )
+
+    unresolved = _accepted_assembly_diagnostics(assembly)
+    unresolved["existing_model_result"]["assembly_resolution"] = {
+        **unresolved["existing_model_result"]["assembly_resolution"],
+        "active_component_count": 0,
+        "missing_path_count": 3,
+    }
+    rejected = _build_production_acceptance_result(
+        plan,
+        True,
+        unresolved,
+        {
+            "sldasm": "model.SLDASM",
+            "slddrw": "drawing.SLDDRW",
+            "pdf": "drawing.pdf",
+            "dwg": "drawing.dwg",
+        },
+        {
+            "front": "front.png",
+            "top": "top.png",
+            "right": "right.png",
+            "isometric": "isometric.png",
+        },
+    )
+    _assert(rejected["ok"] is False, f"Expected unresolved imported assembly rejection: {rejected}")
+    _assert(
+        "assembly_components_resolved" in rejected.get("failures", []),
+        f"Expected assembly component gate failure: {rejected}",
+    )
+
+
+def _accepted_assembly_diagnostics(source: Path) -> dict:
+    diagnostics = _accepted_diagnostics(source)
+    diagnostics["existing_model_result"] = {
+        "status": "existing_model_imported",
+        "copied_to_run_dir": True,
+        "source_path": os.fspath(source),
+        "run_model_path": os.fspath(source),
+        "document_type": "assembly",
+        "reference_copy_result": {
+            "status": "references_copied",
+            "copied_count": 9,
+            "search_paths": [os.fspath(source.parent / "assembly_refs")],
+        },
+        "assembly_resolution": {
+            "status": "assembly_components_resolved",
+            "component_count": 12,
+            "active_component_count": 12,
+            "suppressed_component_count": 0,
+            "missing_path_count": 0,
+        },
+    }
+    diagnostics["drawing_view_result"] = {
+        "status": "created",
+        "views": [
+            {"role": "front"},
+            {"role": "top"},
+            {"role": "right"},
+            {"role": "isometric"},
+        ],
+        "layout": {
+            "status": "layout_verified",
+            "layout_style": "existing_model_assembly",
+            "projection": "first_angle",
+            "clipped_view_count": 0,
+            "scale": 0.16,
+        },
+        "assembly_draft": {
+            "status": "existing_model_assembly_draft_created",
+            "classification": "imported_assembly_draft",
+        },
+    }
+    diagnostics["drawing_dimension_status"] = "basic_dimensions_created"
+    diagnostics["drawing_dimension_result"] = {
+        "status": "basic_dimensions_created",
+        "required_dimensions": ["overall_length", "overall_width", "overall_height"],
+        "created_dimensions": [
+            {
+                "id": "overall_length",
+                "method": "AddHorizontalDimension2",
+                "is_display_dimension": True,
+                "classification": "geometry_verified_dimension",
+                "proxy_dimension": False,
+            },
+            {
+                "id": "overall_width",
+                "method": "model_bbox_readback_note",
+                "is_display_dimension": False,
+                "classification": "geometry_readback_note",
+                "annotation_kind": "existing_model_assembly_overall_size_note",
+                "proxy_dimension": False,
+            },
+            {
+                "id": "overall_height",
+                "method": "AddVerticalDimension2",
+                "is_display_dimension": True,
+                "classification": "geometry_verified_dimension",
+                "proxy_dimension": False,
+            },
+        ],
+        "created_dimension_count": 3,
+        "missing_dimensions": [],
+        "display_dimension_count": 2,
+        "dimension_layout_status": "existing_model_assembly_dimensions_created",
+        "geometry_verified_dimension_count": 3,
+    }
+    diagnostics["drawing_metadata_note_result"] = {
+        "status": "manufacturing_note_created",
+        "manufacturing_note": {
+            "status": "manufacturing_note_created",
+            "text": (
+                "本图基于导入三维模型自动生成。\n"
+                "未注明尺寸由导入三维模型几何读取，仅供审图/加工前确认。\n"
+                "未注公差、材料、表面处理按人工补充文件或订单要求执行。\n"
+                "关键尺寸/公差需人工确认后方可生产放行。"
+            ),
+        },
+    }
+    diagnostics["model_geometry_result"] = {"status": "geometry_verified", "body_count": 12}
+    diagnostics["mass_property_status"] = "mass_property_failed"
+    diagnostics["mass_property_result"] = {
+        "status": "mass_property_failed",
+        "failure_reason": "Imported assembly has unresolved material mass readback.",
+    }
+    return diagnostics
 
 
 def _assert(condition: bool, message: str) -> None:

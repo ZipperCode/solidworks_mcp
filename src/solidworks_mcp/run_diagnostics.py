@@ -318,15 +318,18 @@ def _current_acceptance_gate_failures(
         "simulation_results_within_limits": _simulation_limits_evidence_ok(diagnostics),
         "simulation_report_verified": _simulation_report_evidence_ok(diagnostics),
         "existing_model_imported": _existing_model_import_evidence_ok(diagnostics),
+        "assembly_components_resolved": _existing_model_assembly_components_evidence_ok(diagnostics),
         "drawing_views_not_clipped": _drawing_view_layout_evidence_ok(diagnostics),
         "existing_model_overall_note_created": _existing_model_overall_note_evidence_ok(diagnostics),
         "manufacturing_draft_created": _manufacturing_draft_evidence_ok(diagnostics),
         "gb_first_angle_layout": _manufacturing_layout_evidence_ok(diagnostics),
         "manufacturing_views_created": _manufacturing_views_evidence_ok(diagnostics),
+        "assembly_views_created": _existing_model_assembly_views_evidence_ok(diagnostics),
         "rotational_axis_verified": _rotational_axis_evidence_ok(diagnostics),
         "section_view_created": _section_view_evidence_ok(diagnostics),
         "centerline_created": _centerline_evidence_ok(diagnostics),
         "manufacturing_dimensions_created": _manufacturing_dimension_evidence_ok(diagnostics),
+        "assembly_dimensions_created": _existing_model_assembly_dimension_evidence_ok(diagnostics),
         "imported_model_uncertainty_note_created": _manufacturing_uncertainty_note_evidence_ok(diagnostics),
         "model_geometry_verified": _model_geometry_evidence_ok(diagnostics),
         "mass_properties_verified": _mass_property_evidence_ok(diagnostics),
@@ -469,6 +472,34 @@ def _current_production_gate_ids(stored_acceptance: dict[str, Any]) -> tuple[str
             "document_state_audit_verified",
         )
     if summary.get("trusted_workflow_status") == "controlled_existing_model_drawing":
+        if summary.get("existing_model_document_type") == "assembly":
+            return (
+                "execution_ok",
+                "trusted_controlled_workflow",
+                "preflight_ready",
+                "existing_model_imported",
+                "assembly_components_resolved",
+                "gb_first_angle_layout",
+                "assembly_views_created",
+                "drawing_views_not_clipped",
+                "basic_dimensions_created",
+                "assembly_dimensions_created",
+                "trusted_basic_dimensions",
+                "imported_model_uncertainty_note_created",
+                "material_verified",
+                "custom_properties_verified",
+                "model_geometry_verified",
+                "artifacts_ready",
+                "artifact_content_ready",
+                "cad_artifact_content",
+                "drawing_pdf_semantic_content",
+                "required_output_files",
+                "requested_output_files",
+                "required_preview_files",
+                "cleanup_completed",
+                "cleanup_verified",
+                "document_state_audit_verified",
+            )
         return (
             "execution_ok",
             "trusted_controlled_workflow",
@@ -607,9 +638,16 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
         "existing_model_overall_dimensions_created",
         "imported_model_dimensions_created",
         "existing_model_manufacturing_dimensions_created",
+        "existing_model_assembly_dimensions_created",
     }
-    if result.get("dimension_layout_status") == "existing_model_manufacturing_dimensions_created":
+    if result.get("dimension_layout_status") == "existing_model_assembly_dimensions_created":
         created_ids = {str(item.get("id")) for item in created if item.get("id")}
+        required_ids = {
+            str(item)
+            for item in result.get("required_dimensions", []) or []
+            if item
+        } or {"overall_length", "overall_width", "overall_height"}
+        required_display_count = min(2, len(required_ids))
         display_count = _safe_positive_int(result.get("display_dimension_count"))
         geometry_count = _safe_positive_int(result.get("geometry_verified_dimension_count"))
         if geometry_count == 0:
@@ -621,9 +659,39 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
             )
         return (
             _basic_dimension_evidence_ok(diagnostics)
-            and {"overall_outer_diameter", "inner_diameter", "overall_length"}.issubset(created_ids)
-            and display_count >= 3
-            and geometry_count >= 3
+            and required_ids.issubset(created_ids)
+            and display_count >= required_display_count
+            and geometry_count >= len(required_ids)
+            and not proxy_dimensions
+        )
+    if result.get("dimension_layout_status") == "existing_model_manufacturing_dimensions_created":
+        created_ids = {str(item.get("id")) for item in created if item.get("id")}
+        required_ids = {
+            str(item)
+            for item in result.get("required_dimensions", []) or []
+            if item
+        }
+        if not required_ids:
+            draft = _manufacturing_draft_result(diagnostics)
+            required_ids = (
+                {"overall_length"}
+                if draft.get("classification") == "imported_prismatic_machining_draft"
+                else {"overall_outer_diameter", "inner_diameter", "overall_length"}
+            )
+        display_count = _safe_positive_int(result.get("display_dimension_count"))
+        geometry_count = _safe_positive_int(result.get("geometry_verified_dimension_count"))
+        if geometry_count == 0:
+            geometry_count = sum(
+                1
+                for item in created
+                if item.get("classification") == "geometry_verified_dimension"
+                and item.get("proxy_dimension") is not True
+            )
+        return (
+            _basic_dimension_evidence_ok(diagnostics)
+            and required_ids.issubset(created_ids)
+            and display_count >= len(required_ids)
+            and geometry_count >= len(required_ids)
             and not proxy_dimensions
         )
     if result.get("dimension_layout_status") == "existing_model_overall_annotations_created":
@@ -651,6 +719,30 @@ def _existing_model_import_evidence_ok(diagnostics: Any) -> bool:
     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
     result = _as_dict(diagnostics.get("existing_model_result"))
     return result.get("status") == "existing_model_imported" and result.get("copied_to_run_dir") is True
+
+
+def _existing_model_assembly_components_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether imported assembly components resolved into the isolated run directory."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    result = _as_dict(diagnostics.get("existing_model_result"))
+    if result.get("document_type") != "assembly":
+        return False
+    resolution = _as_dict(result.get("assembly_resolution"))
+    try:
+        component_count = int(resolution.get("component_count") or 0)
+        active_count = int(resolution.get("active_component_count") or 0)
+        missing_count = int(resolution.get("missing_path_count") or 0)
+        suppressed_count = int(resolution.get("suppressed_component_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        resolution.get("status") == "assembly_components_resolved"
+        and component_count >= 1
+        and active_count >= 1
+        and missing_count == 0
+        and suppressed_count < component_count
+    )
 
 
 def _drawing_view_layout_evidence_ok(diagnostics: Any) -> bool:
@@ -689,7 +781,8 @@ def _manufacturing_draft_evidence_ok(diagnostics: Any) -> bool:
     draft = _manufacturing_draft_result(diagnostics)
     return (
         draft.get("status") == "existing_model_manufacturing_draft_created"
-        and draft.get("classification") == "imported_rotational_machining_draft"
+        and draft.get("classification")
+        in {"imported_rotational_machining_draft", "imported_prismatic_machining_draft"}
     )
 
 
@@ -699,11 +792,9 @@ def _manufacturing_layout_evidence_ok(diagnostics: Any) -> bool:
     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
     view_result = _as_dict(diagnostics.get("drawing_view_result"))
     layout = _as_dict(view_result.get("layout"))
-    return (
-        layout.get("status") == "layout_verified"
-        and layout.get("layout_style") == "manufacturing_rotational"
-        and layout.get("projection") == "first_angle"
-    )
+    if layout.get("status") != "layout_verified" or layout.get("projection") != "first_angle":
+        return False
+    return layout.get("layout_style") in {"manufacturing_rotational", "existing_model_assembly"}
 
 
 def _manufacturing_views_evidence_ok(diagnostics: Any) -> bool:
@@ -719,9 +810,30 @@ def _manufacturing_views_evidence_ok(diagnostics: Any) -> bool:
     return diagnostics.get("drawing_view_status") == "created" and {"section", "end", "isometric"}.issubset(roles)
 
 
+def _existing_model_assembly_views_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether imported assembly drawing views exist."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    view_result = _as_dict(diagnostics.get("drawing_view_result"))
+    roles = {
+        str(item.get("role"))
+        for item in view_result.get("views", []) or []
+        if isinstance(item, dict) and item.get("role")
+    }
+    return diagnostics.get("drawing_view_status") == "created" and {
+        "front",
+        "top",
+        "right",
+        "isometric",
+    }.issubset(roles)
+
+
 def _rotational_axis_evidence_ok(diagnostics: Any) -> bool:
     """Return whether a verified rotational axis was identified."""
 
+    draft = _manufacturing_draft_result(diagnostics)
+    if draft.get("classification") == "imported_prismatic_machining_draft":
+        return _as_dict(draft.get("rotational_axis")).get("status") == "not_required"
     axis = _as_dict(_manufacturing_draft_result(diagnostics).get("rotational_axis"))
     try:
         confidence = float(axis.get("confidence") or 0.0)
@@ -750,6 +862,8 @@ def _centerline_evidence_ok(diagnostics: Any) -> bool:
     draft = _manufacturing_draft_result(diagnostics)
     centerline = _as_dict(draft.get("centerline"))
     center_mark = _as_dict(draft.get("center_mark"))
+    if draft.get("classification") == "imported_prismatic_machining_draft":
+        return centerline.get("status") == "not_required" and center_mark.get("status") == "not_required"
     return (
         centerline.get("status") == "centerline_created"
         and _safe_positive_int(centerline.get("centerline_count")) >= 1
@@ -762,6 +876,17 @@ def _manufacturing_dimension_evidence_ok(diagnostics: Any) -> bool:
     """Return whether imported-model manufacturing dimensions are complete."""
 
     return _trusted_dimension_evidence_ok(diagnostics)
+
+
+def _existing_model_assembly_dimension_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether imported assembly overall dimensions are complete."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    result = _as_dict(diagnostics.get("drawing_dimension_result"))
+    return (
+        result.get("dimension_layout_status") == "existing_model_assembly_dimensions_created"
+        and _trusted_dimension_evidence_ok(diagnostics)
+    )
 
 
 def _manufacturing_uncertainty_note_evidence_ok(diagnostics: Any) -> bool:

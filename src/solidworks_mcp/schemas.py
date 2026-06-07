@@ -35,7 +35,7 @@ SUPPORTED_EXPORT_FORMATS = {
 SUPPORTED_THREAD_STANDARDS = {"ISO_metric_coarse"}
 SUPPORTED_THREAD_SPECS = {"M3", "M4", "M5", "M6", "M8"}
 SUPPORTED_SEMANTIC_SELECTORS = {"top_face", "outer_edges"}
-SUPPORTED_DRAWING_VIEW_STYLES = {"standard", "manufacturing_rotational"}
+SUPPORTED_DRAWING_VIEW_STYLES = {"standard", "manufacturing_rotational", "assembly_general"}
 ISO_METRIC_COARSE_THREAD_GEOMETRY = {
     "M3": {"nominal_diameter": 3.0, "tap_drill_diameter": 2.5, "pitch": 0.5},
     "M4": {"nominal_diameter": 4.0, "tap_drill_diameter": 3.3, "pitch": 0.7},
@@ -98,7 +98,7 @@ class DrawingProfile:
     template_path: str | None = None
     sheet_format: str = "A3"
     projection: Literal["third_angle", "first_angle"] = "third_angle"
-    view_style: Literal["standard", "manufacturing_rotational"] = "standard"
+    view_style: Literal["standard", "manufacturing_rotational", "assembly_general"] = "standard"
     include_isometric: bool = True
     include_basic_dimensions: bool = True
     export_formats: tuple[str, ...] = ("pdf", "dwg")
@@ -129,7 +129,7 @@ class DrawingProfile:
         view_style = raw.get("view_style", raw.get("style", "standard"))
         if view_style not in SUPPORTED_DRAWING_VIEW_STYLES:
             raise PlanValidationError(
-                "drawing_profile.view_style must be standard or manufacturing_rotational"
+                "drawing_profile.view_style must be standard, manufacturing_rotational, or assembly_general"
             )
 
         return cls(
@@ -591,6 +591,30 @@ def _validate_existing_model_fields(parameters: dict[str, Any], index: int) -> N
     copy_to_run_dir = parameters.get("copy_to_run_dir", True)
     if not isinstance(copy_to_run_dir, bool):
         raise PlanValidationError(f"operations[{index}].parameters.copy_to_run_dir must be boolean when provided")
+
+    reference_search_paths = parameters.get("reference_search_paths", [])
+    if reference_search_paths is None:
+        reference_search_paths = []
+    if not isinstance(reference_search_paths, list):
+        raise PlanValidationError(
+            f"operations[{index}].parameters.reference_search_paths must be an array when provided"
+        )
+    for path_index, raw_reference_path in enumerate(reference_search_paths):
+        if not isinstance(raw_reference_path, str) or not raw_reference_path.strip():
+            raise PlanValidationError(
+                f"operations[{index}].parameters.reference_search_paths[{path_index}] must be a non-empty string"
+            )
+        reference_path = Path(raw_reference_path)
+        if not reference_path.exists():
+            raise PlanValidationError(
+                f"operations[{index}].parameters.reference_search_paths[{path_index}] does not exist: "
+                f"{raw_reference_path}"
+            )
+        if not reference_path.is_dir():
+            raise PlanValidationError(
+                f"operations[{index}].parameters.reference_search_paths[{path_index}] must be a directory: "
+                f"{raw_reference_path}"
+            )
 
     document_type = parameters.get("document_type")
     if document_type is not None:
@@ -1986,6 +2010,10 @@ def existing_model_parameters_from_plan(plan: "ModelPlan") -> dict[str, Any] | N
             "path": path_to_string(path),
             "document_type": document_type,
             "copy_to_run_dir": bool(operation.parameters.get("copy_to_run_dir", True)),
+            "reference_search_paths": [
+                path_to_string(Path(str(reference_path)))
+                for reference_path in operation.parameters.get("reference_search_paths", []) or []
+            ],
             "source_name": path.name,
             "source_suffix": suffix,
         }

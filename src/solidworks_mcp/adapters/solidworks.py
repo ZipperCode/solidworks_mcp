@@ -440,6 +440,16 @@ class SolidWorksCOMAdapter(CADAdapter):
             run_model_path = source_path
             copied_to_run_dir = False
         document_type = str(params.get("document_type") or "part").lower()
+        reference_copy_result = (
+            _copy_existing_model_reference_files(params, imported_dir, source_path)
+            if document_type == "assembly" and copied_to_run_dir
+            else {
+                "status": "not_requested" if document_type != "assembly" else "skipped",
+                "reason": "reference copies are only isolated when copy_to_run_dir=true",
+                "copied_count": 0,
+                "search_paths": list(params.get("reference_search_paths", [])),
+            }
+        )
         doc_type = SW_DOC_ASSEMBLY if document_type == "assembly" else SW_DOC_PART
         errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
@@ -478,6 +488,11 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._active_part_path = run_model_path
         self._active_part_title = self._document_title(document) or run_model_path.name
         bbox = _read_model_bounding_box(document)
+        assembly_resolution = (
+            _inspect_existing_model_assembly_components(document, imported_dir)
+            if document_type == "assembly"
+            else None
+        )
         self._existing_model_result = {
             "status": "existing_model_imported",
             "source_path": path_to_string(source_path),
@@ -487,7 +502,10 @@ class SolidWorksCOMAdapter(CADAdapter):
             "open_errors": int(errors.value),
             "open_warnings": int(warnings.value),
             "bbox_m": bbox,
+            "reference_copy_result": reference_copy_result,
         }
+        if assembly_resolution is not None:
+            self._existing_model_result["assembly_resolution"] = assembly_resolution
         self._model_geometry_status = "geometry_verified"
         self._model_geometry_result = {
             "status": "geometry_verified",
@@ -499,6 +517,10 @@ class SolidWorksCOMAdapter(CADAdapter):
                 "source_exists": source_path.exists(),
                 "run_copy_exists": run_model_path.exists(),
                 "bbox_dimensions_positive": _bbox_dimensions_positive(bbox),
+                "assembly_components_resolved": (
+                    assembly_resolution is None
+                    or assembly_resolution.get("status") == "assembly_components_resolved"
+                ),
             },
         }
         self._mass_property_result = self._read_existing_model_mass_properties(document)
@@ -686,7 +708,13 @@ class SolidWorksCOMAdapter(CADAdapter):
 
         part_path = self._ensure_part_saved(plan)
         existing_model = existing_model_parameters_from_plan(plan)
-        if existing_model is not None:
+        if existing_model is not None and existing_model.get("document_type") == "assembly":
+            view_result = self._create_existing_model_assembly_drawing_views(
+                part_path,
+                plan,
+                profile,
+            )
+        elif existing_model is not None:
             view_result = self._create_existing_model_manufacturing_drawing_views(
                 part_path,
                 plan,
@@ -1136,7 +1164,15 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._activate_part_document()
         model = self._require_model()
         previews: dict[str, str] = {}
-        if existing_model_parameters_from_plan(plan) is not None:
+        existing_model = existing_model_parameters_from_plan(plan)
+        if existing_model is not None and existing_model.get("document_type") == "assembly":
+            view_commands = {
+                "front": "*Front",
+                "top": "*Top",
+                "right": "*Right",
+                "isometric": "*Isometric",
+            }
+        elif existing_model is not None:
             view_commands = {
                 "section": "*Front",
                 "end": "*Top",
@@ -6166,6 +6202,31 @@ class SolidWorksCOMAdapter(CADAdapter):
             "errors": errors,
         }
 
+    def _create_existing_model_assembly_drawing_views(
+        self,
+        assembly_path: Path,
+        plan: ModelPlan,
+        profile: DrawingProfile,
+    ) -> dict[str, Any]:
+        """Create a first-angle four-view layout for an imported assembly."""
+
+        view_result = self._create_standard_drawing_views(assembly_path, plan, profile)
+        layout = view_result.get("layout")
+        if isinstance(layout, dict):
+            layout["layout_style"] = "existing_model_assembly"
+            layout["projection"] = profile.projection
+            layout["assembly_resolution"] = self._existing_model_result.get("assembly_resolution")
+        view_result["assembly_draft"] = {
+            "status": (
+                "existing_model_assembly_draft_created"
+                if view_result.get("status") == "created"
+                else "existing_model_assembly_draft_incomplete"
+            ),
+            "classification": "imported_assembly_draft",
+            "component_resolution": self._existing_model_result.get("assembly_resolution"),
+        }
+        return view_result
+
     def _build_standard_drawing_layout(self, plan: ModelPlan, profile: DrawingProfile) -> dict[str, Any]:
         """Calculate a conservative four-view layout from sheet and model extents."""
 
@@ -6177,10 +6238,14 @@ class SolidWorksCOMAdapter(CADAdapter):
         )
         safe_left = margin_m
         safe_right = max(sheet_width_m - margin_m, margin_m + 0.05)
-        safe_bottom = margin_m + title_block_m
+        note_block_m = 0.0
+        if profile.view_style == "assembly_general":
+            note_block_m = min(max(sheet_height_m * 0.16, 0.040), 0.060)
+        safe_bottom = margin_m + title_block_m + note_block_m
         safe_top = max(sheet_height_m - margin_m, safe_bottom + 0.05)
         if safe_top - safe_bottom < 0.08:
             safe_bottom = margin_m
+            note_block_m = 0.0
             title_block_m = 0.0
 
         usable_width = max(safe_right - safe_left, 0.05)
@@ -6228,6 +6293,13 @@ class SolidWorksCOMAdapter(CADAdapter):
             "right": {"x": right_x, "y": lower_y, **role_sizes["right"]},
             "isometric": {"x": right_x, "y": upper_y, **role_sizes["isometric"]},
         }
+        if profile.view_style == "assembly_general":
+            slots["technical_note"] = {
+                "x": safe_left + 0.010,
+                "y": margin_m + title_block_m + 0.010,
+                "width_m": usable_width * 0.48,
+                "height_m": note_block_m,
+            }
         return {
             "status": "planned",
             "auto_layout": profile.auto_layout,
@@ -6240,6 +6312,7 @@ class SolidWorksCOMAdapter(CADAdapter):
             },
             "margin_m": margin_m,
             "title_block_reserved_m": title_block_m,
+            "technical_note_reserved_m": note_block_m,
             "cell_size_m": {"width": cell_width, "height": cell_height},
             "gap_m": {"x": gap_x, "y": gap_y},
             "scale": target_scale,
@@ -6327,11 +6400,23 @@ class SolidWorksCOMAdapter(CADAdapter):
         missing_roles = [role for role in required_roles if role not in created_roles]
         layout_result = self._verify_standard_drawing_layout(layout, views)
         layout.update(layout_result)
-        axis_result = _existing_model_rotational_axis_result(layout)
-        centerline_result, center_mark_result = self._create_existing_model_centerline_marks(
-            drawing,
-            layout,
+        geometry_profile = layout.get("existing_model_geometry_profile")
+        if not isinstance(geometry_profile, dict):
+            geometry_profile = _existing_model_geometry_profile(layout.get("model_dimensions_m"))
+        is_rotational = geometry_profile.get("kind") == "rotational"
+        axis_result = (
+            _existing_model_rotational_axis_result(layout)
+            if is_rotational
+            else {"status": "not_required", "reason": "non_rotational_imported_model"}
         )
+        if is_rotational:
+            centerline_result, center_mark_result = self._create_existing_model_centerline_marks(
+                drawing,
+                layout,
+            )
+        else:
+            centerline_result = {"status": "not_required", "reason": "non_rotational_imported_model"}
+            center_mark_result = {"status": "not_required", "reason": "non_rotational_imported_model"}
         section_payload = {
             key: value
             for key, value in section_result.items()
@@ -6345,13 +6430,19 @@ class SolidWorksCOMAdapter(CADAdapter):
             "status": (
                 "existing_model_manufacturing_draft_created"
                 if not missing_roles
-                and axis_result.get("status") == "axis_verified"
                 and section_payload.get("status") == "section_view_created"
-                and centerline_result.get("status") == "centerline_created"
-                and center_mark_result.get("status") == "center_mark_created"
+                and (
+                    not is_rotational
+                    or (
+                        axis_result.get("status") == "axis_verified"
+                        and centerline_result.get("status") == "centerline_created"
+                        and center_mark_result.get("status") == "center_mark_created"
+                    )
+                )
                 else "existing_model_manufacturing_draft_incomplete"
             ),
-            "classification": "imported_rotational_machining_draft",
+            "classification": geometry_profile.get("draft_classification", "imported_rotational_machining_draft"),
+            "geometry_profile": geometry_profile,
             "rotational_axis": axis_result,
             "section_view": section_payload,
             "centerline": centerline_result,
@@ -6397,6 +6488,7 @@ class SolidWorksCOMAdapter(CADAdapter):
         dimensions = _bbox_dimensions_m(bbox_result)
         if not dimensions:
             dimensions = {"x": 0.050, "y": 0.025, "z": 0.050}
+        geometry_profile = _existing_model_geometry_profile(dimensions)
         x_dim = max(float(dimensions.get("x") or 0.0), 0.001)
         y_dim = max(float(dimensions.get("y") or 0.0), 0.001)
         z_dim = max(float(dimensions.get("z") or 0.0), 0.001)
@@ -6411,8 +6503,8 @@ class SolidWorksCOMAdapter(CADAdapter):
             main_width / max(diameter_dim, 0.001),
             main_height / max(max(axial_dim, diameter_dim * 0.45), 0.001),
         ) * 0.62
-        target_scale = min(max(raw_scale, 0.20), 2.00)
-        isometric_scale = min(max(target_scale * 0.40, 0.20), 1.00)
+        target_scale = min(max(raw_scale, 0.02), 2.00)
+        isometric_scale = min(max(target_scale * 0.40, 0.02), 1.00)
 
         section_x = safe_left + main_width * 0.46
         section_y = safe_bottom + safe_height * 0.63
@@ -6471,6 +6563,7 @@ class SolidWorksCOMAdapter(CADAdapter):
             "model_bbox_result": bbox_result,
             "model_dimensions_m": dimensions,
             "model_dimensions_mm": {key: round(value * 1000.0, 3) for key, value in dimensions.items()},
+            "existing_model_geometry_profile": geometry_profile,
             "slots": slots,
             "plan_name": plan.name,
         }
@@ -7061,7 +7154,7 @@ class SolidWorksCOMAdapter(CADAdapter):
 
         existing_model = existing_model_parameters_from_plan(plan)
         required_dimensions = (
-            _existing_model_overall_dimension_ids()
+            _existing_model_dimension_ids_from_view_result(view_result)
             if existing_model is not None
             else _trusted_basic_dimension_ids_from_plan(plan)
         )
@@ -7319,6 +7412,18 @@ class SolidWorksCOMAdapter(CADAdapter):
         }
 
         created_by_id: dict[str, dict[str, Any]] = {}
+        layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+        is_assembly_drawing = isinstance(layout, dict) and layout.get("layout_style") == "existing_model_assembly"
+        completed_layout_status = (
+            "existing_model_assembly_dimensions_created"
+            if is_assembly_drawing
+            else "existing_model_manufacturing_dimensions_created"
+        )
+        incomplete_layout_status = (
+            "existing_model_assembly_dimensions_incomplete"
+            if is_assembly_drawing
+            else "existing_model_manufacturing_dimensions_incomplete"
+        )
         specs = _existing_model_overall_dimension_specs(self._drawing_view_handles, view_result)
         result["overall_dimension_spec_count"] = len(specs)
         for spec in specs:
@@ -7344,17 +7449,44 @@ class SolidWorksCOMAdapter(CADAdapter):
             for dimension_id in required_dimensions
             if dimension_id not in created_by_id
         ]
-        result["display_dimension_count"] = len(result["created_dimensions"])
+        result["display_dimension_count"] = _display_dimension_count(result["created_dimensions"])
         result["geometry_verified_dimension_count"] = len(
             [
                 item
                 for item in result["created_dimensions"]
-                if item.get("classification") == "geometry_verified_dimension"
+                if item.get("classification") in {"geometry_verified_dimension", "geometry_readback_note"}
             ]
         )
+        if is_assembly_drawing and result["missing_dimensions"]:
+            display_dimension_count = _display_dimension_count(result["created_dimensions"])
+            if display_dimension_count >= min(2, len(required_dimensions)):
+                for note_item in _existing_model_assembly_note_dimension_items(
+                    result["missing_dimensions"],
+                    view_result,
+                ):
+                    created_by_id[str(note_item["id"])] = note_item
+                result["created_dimensions"] = [
+                    created_by_id[dimension_id]
+                    for dimension_id in required_dimensions
+                    if dimension_id in created_by_id
+                ]
+                result["created_dimension_count"] = len(result["created_dimensions"])
+                result["missing_dimensions"] = [
+                    dimension_id
+                    for dimension_id in required_dimensions
+                    if dimension_id not in created_by_id
+                ]
+                result["display_dimension_count"] = _display_dimension_count(result["created_dimensions"])
+                result["geometry_verified_dimension_count"] = len(
+                    [
+                        item
+                        for item in result["created_dimensions"]
+                        if item.get("classification") in {"geometry_verified_dimension", "geometry_readback_note"}
+                    ]
+                )
         if not result["missing_dimensions"]:
             result["status"] = "basic_dimensions_created"
-            result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
+            result["dimension_layout_status"] = completed_layout_status
             self.record_event("drawing.basic_dimensions", "completed", result)
             return result
 
@@ -7384,23 +7516,24 @@ class SolidWorksCOMAdapter(CADAdapter):
             for dimension_id in required_dimensions
             if dimension_id not in created_by_id
         ]
-        result["display_dimension_count"] = len(result["created_dimensions"])
+        result["display_dimension_count"] = _display_dimension_count(result["created_dimensions"])
         result["geometry_verified_dimension_count"] = len(
             [
                 item
                 for item in result["created_dimensions"]
                 if item.get("classification") == "geometry_verified_dimension"
                 or item.get("construction_reference_dimension") is True
+                or item.get("classification") == "geometry_readback_note"
             ]
         )
         if not result["missing_dimensions"]:
             result["status"] = "basic_dimensions_created"
-            result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
+            result["dimension_layout_status"] = completed_layout_status
             self.record_event("drawing.basic_dimensions", "completed", result)
             return result
 
         result["status"] = "dimension_creation_failed"
-        result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_incomplete"
+        result["dimension_layout_status"] = incomplete_layout_status
         result["failure_reason"] = f"Missing required existing-model manufacturing dimensions: {result['missing_dimensions']}"
         self.record_event("drawing.basic_dimensions", "failed", result)
         return result
@@ -10489,7 +10622,7 @@ def _best_existing_model_extreme_edge_pair(edges: list[Any], spec: dict[str, Any
 
     selector_data = spec.get("edge_selector_data", {})
     axis = str(selector_data.get("axis", "")).lower() if isinstance(selector_data, dict) else ""
-    if axis not in {"x", "y"}:
+    if axis not in {"x", "y", "z"}:
         return None
     try:
         expected_length = float(selector_data.get("expected_length_m") or 0.0)
@@ -10509,10 +10642,14 @@ def _best_existing_model_extreme_edge_pair(edges: list[Any], spec: dict[str, Any
             axis_mid = (start[0] + end[0]) / 2.0
             perpendicular_length = max(dy, dz)
             axis_span = dx
-        else:
+        elif axis == "y":
             axis_mid = (start[1] + end[1]) / 2.0
             perpendicular_length = max(dx, dz)
             axis_span = dy
+        else:
+            axis_mid = (start[2] + end[2]) / 2.0
+            perpendicular_length = max(dx, dy)
+            axis_span = dz
         if perpendicular_length <= max(axis_span * 1.5, 0.0005):
             continue
         candidates.append(
@@ -12288,6 +12425,216 @@ def _existing_model_overall_dimension_ids() -> list[str]:
     return ["overall_outer_diameter", "inner_diameter", "overall_length"]
 
 
+def _existing_model_prismatic_dimension_ids() -> list[str]:
+    """Return stable ids for imported non-rotational overall drawing dimensions."""
+
+    return ["overall_length"]
+
+
+def _existing_model_assembly_dimension_ids() -> list[str]:
+    """Return stable ids for imported assembly overall drawing dimensions."""
+
+    return ["overall_length", "overall_width", "overall_height"]
+
+
+def _existing_model_dimension_ids_from_view_result(view_result: dict[str, Any]) -> list[str]:
+    """Return imported-model drawing dimensions required by the detected geometry profile."""
+
+    layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+    if isinstance(layout, dict) and layout.get("layout_style") == "existing_model_assembly":
+        return _existing_model_assembly_dimension_ids()
+    draft = view_result.get("manufacturing_draft") if isinstance(view_result, dict) else {}
+    if isinstance(draft, dict) and draft.get("classification") == "imported_prismatic_machining_draft":
+        return _existing_model_prismatic_dimension_ids()
+    return _existing_model_overall_dimension_ids()
+
+
+def _existing_model_geometry_profile(dimensions: Any) -> dict[str, Any]:
+    """Classify imported-model overall geometry for drawing evidence requirements."""
+
+    if not isinstance(dimensions, dict):
+        return {
+            "kind": "rotational",
+            "draft_classification": "imported_rotational_machining_draft",
+            "reason": "missing_dimensions_fallback",
+        }
+    values = []
+    for axis in ("x", "y", "z"):
+        try:
+            numeric = float(dimensions.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        if numeric > 0:
+            values.append((axis, numeric))
+    if len(values) < 3:
+        return {
+            "kind": "rotational",
+            "draft_classification": "imported_rotational_machining_draft",
+            "reason": "incomplete_dimensions_fallback",
+        }
+    values.sort(key=lambda item: item[1])
+    closest_pair: tuple[tuple[str, float], tuple[str, float]] | None = None
+    closest_ratio = float("inf")
+    for left_index, first in enumerate(values):
+        for second in values[left_index + 1:]:
+            ratio = abs(second[1] - first[1]) / max(second[1], first[1], 0.001)
+            if ratio < closest_ratio:
+                closest_ratio = ratio
+                closest_pair = (first, second)
+    if closest_pair is not None and closest_ratio <= 0.12:
+        return {
+            "kind": "rotational",
+            "draft_classification": "imported_rotational_machining_draft",
+            "reason": "two_bbox_axes_match_within_12_percent",
+            "matched_axes": [closest_pair[0][0], closest_pair[1][0]],
+            "matched_axis_ratio": closest_ratio,
+        }
+    return {
+        "kind": "prismatic",
+        "draft_classification": "imported_prismatic_machining_draft",
+        "reason": "no_near_equal_bbox_axes",
+        "matched_axis_ratio": closest_ratio if closest_pair is not None else None,
+    }
+
+
+def _copy_existing_model_reference_files(
+    params: dict[str, Any],
+    imported_dir: Path,
+    source_path: Path,
+) -> dict[str, Any]:
+    """Copy user-supplied assembly reference candidates into the isolated run directory."""
+
+    search_paths = [Path(str(path)) for path in params.get("reference_search_paths", []) or []]
+    result: dict[str, Any] = {
+        "status": "not_requested" if not search_paths else "references_copied",
+        "search_paths": [path_to_string(path) for path in search_paths],
+        "copied": [],
+        "skipped": [],
+        "copied_count": 0,
+        "skipped_count": 0,
+    }
+    if not search_paths:
+        result["reason"] = "no reference_search_paths provided"
+        return result
+    seen_names = {source_path.name.lower()}
+    supported_suffixes = {".sldprt", ".sldasm"}
+    for search_path in search_paths:
+        if not search_path.exists() or not search_path.is_dir():
+            result.setdefault("invalid_paths", []).append(path_to_string(search_path))
+            continue
+        for candidate in sorted(search_path.iterdir(), key=lambda item: item.name.lower()):
+            if not candidate.is_file() or candidate.suffix.lower() not in supported_suffixes:
+                continue
+            name_key = candidate.name.lower()
+            if name_key in seen_names:
+                result["skipped"].append(
+                    {
+                        "source_path": path_to_string(candidate),
+                        "reason": "duplicate_name_or_source_model",
+                    }
+                )
+                continue
+            destination = imported_dir / candidate.name
+            shutil.copy2(candidate, destination)
+            seen_names.add(name_key)
+            result["copied"].append(
+                {
+                    "source_path": path_to_string(candidate),
+                    "run_path": path_to_string(destination),
+                    "size_bytes": destination.stat().st_size if destination.exists() else None,
+                }
+            )
+    result["copied_count"] = len(result["copied"])
+    result["skipped_count"] = len(result["skipped"])
+    if result["copied_count"] == 0:
+        result["status"] = "references_not_found"
+        result["reason"] = "reference_search_paths contained no unique SolidWorks reference files"
+    return result
+
+
+def _inspect_existing_model_assembly_components(document: Any, imported_dir: Path) -> dict[str, Any]:
+    """Read imported assembly component resolution evidence after SolidWorks opens it."""
+
+    result: dict[str, Any] = {
+        "status": "assembly_components_unresolved",
+        "component_count": 0,
+        "active_component_count": 0,
+        "suppressed_component_count": 0,
+        "missing_path_count": 0,
+        "resolved_path_count": 0,
+        "run_dir_component_count": 0,
+        "components": [],
+    }
+    try:
+        get_components = getattr(document, "GetComponents", None)
+        components = _as_sequence(get_components(False) if callable(get_components) else _call_or_get(document, "GetComponents"))
+    except Exception as exc:
+        result["failure_reason"] = str(exc)
+        return result
+    imported_root = imported_dir.resolve()
+    for component in components:
+        try:
+            name = str(_call_or_get(component, "Name2") or "")
+        except Exception:
+            name = ""
+        try:
+            raw_path = str(_call_or_get(component, "GetPathName") or "")
+        except Exception:
+            raw_path = ""
+        try:
+            suppressed = bool(_call_or_get(component, "IsSuppressed"))
+        except Exception:
+            suppressed = False
+        path = Path(raw_path) if raw_path else None
+        path_exists = bool(path and path.exists())
+        in_run_dir = False
+        if path is not None:
+            try:
+                in_run_dir = path.resolve().is_relative_to(imported_root)
+            except Exception:
+                in_run_dir = False
+        try:
+            modeldoc_resolved = bool(_call_or_get(component, "GetModelDoc2"))
+        except Exception:
+            modeldoc_resolved = False
+        if suppressed:
+            result["suppressed_component_count"] += 1
+        if path_exists:
+            result["resolved_path_count"] += 1
+        else:
+            result["missing_path_count"] += 1
+        if path_exists and not suppressed:
+            result["active_component_count"] += 1
+        if in_run_dir:
+            result["run_dir_component_count"] += 1
+        result["components"].append(
+            {
+                "name": name,
+                "path": raw_path,
+                "path_exists": path_exists,
+                "suppressed": suppressed,
+                "in_run_dir": in_run_dir,
+                "modeldoc_resolved": modeldoc_resolved,
+            }
+        )
+    result["component_count"] = len(result["components"])
+    if (
+        result["component_count"] > 0
+        and result["active_component_count"] > 0
+        and result["missing_path_count"] == 0
+        and result["suppressed_component_count"] < result["component_count"]
+    ):
+        result["status"] = "assembly_components_resolved"
+    else:
+        result["failure_reason"] = (
+            f"component_count={result['component_count']}; "
+            f"active_component_count={result['active_component_count']}; "
+            f"missing_path_count={result['missing_path_count']}; "
+            f"suppressed_component_count={result['suppressed_component_count']}"
+        )
+    return result
+
+
 def _existing_model_overall_dimension_specs(
     views: dict[str, Any],
     view_result: dict[str, Any],
@@ -12295,6 +12642,8 @@ def _existing_model_overall_dimension_specs(
     """Build drawing-sheet dimension specs from imported-model view outlines."""
 
     layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+    if isinstance(layout, dict) and layout.get("layout_style") == "existing_model_assembly":
+        return _existing_model_assembly_dimension_specs(views, view_result)
     model_dimensions = layout.get("model_dimensions_m") if isinstance(layout, dict) else {}
     model_values = []
     if isinstance(model_dimensions, dict):
@@ -12386,6 +12735,151 @@ def _existing_model_overall_dimension_specs(
             }
         )
     return specs
+
+
+def _existing_model_assembly_dimension_specs(
+    views: dict[str, Any],
+    view_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build L/W/H overall dimension specs for imported assembly drawings."""
+
+    layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+    model_dimensions = layout.get("model_dimensions_m") if isinstance(layout, dict) else {}
+    x_dim = _positive_model_dimension(model_dimensions, "x")
+    y_dim = _positive_model_dimension(model_dimensions, "y")
+    z_dim = _positive_model_dimension(model_dimensions, "z")
+    front_outline = _view_outline_for_role("front", views, view_result)
+    top_outline = _view_outline_for_role("top", views, view_result)
+    specs: list[dict[str, Any]] = []
+    edge_types = ("EDGE", "SKETCHSEGMENT", "EXTSKETCHSEGMENT", "LINE", "ARC")
+    if front_outline is not None:
+        left, bottom, right, top = front_outline
+        mid_x = (left + right) / 2.0
+        mid_y = (bottom + top) / 2.0
+        width = right - left
+        height = top - bottom
+        specs.append(
+            {
+                "id": "overall_length",
+                "view_role": "front",
+                "method": "AddHorizontalDimension2",
+                "fallback_methods": ["AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "x",
+                    "expected_length_m": x_dim,
+                    "role": "existing_model_assembly_overall_length",
+                },
+                "points": [
+                    {"x": left, "y": bottom, "selection_types": edge_types},
+                    {"x": right, "y": bottom, "selection_types": edge_types},
+                ],
+                "point_sets": _horizontal_outline_point_sets(front_outline, edge_types),
+                "position": {"x": mid_x, "y": bottom - max(height * 0.16, 0.012)},
+            }
+        )
+        specs.append(
+            {
+                "id": "overall_height",
+                "view_role": "front",
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "z",
+                    "expected_length_m": z_dim,
+                    "role": "existing_model_assembly_overall_height",
+                },
+                "points": [
+                    {"x": right, "y": bottom, "selection_types": edge_types},
+                    {"x": right, "y": top, "selection_types": edge_types},
+                ],
+                "point_sets": _vertical_outline_point_sets(front_outline, edge_types),
+                "position": {"x": right + max(width * 0.12, 0.012), "y": mid_y},
+            }
+        )
+    if top_outline is not None:
+        left, bottom, right, top = top_outline
+        mid_y = (bottom + top) / 2.0
+        width = right - left
+        specs.append(
+            {
+                "id": "overall_width",
+                "view_role": "top",
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "y",
+                    "expected_length_m": y_dim,
+                    "role": "existing_model_assembly_overall_width",
+                },
+                "points": [
+                    {"x": right, "y": bottom, "selection_types": edge_types},
+                    {"x": right, "y": top, "selection_types": edge_types},
+                ],
+                "point_sets": _vertical_outline_point_sets(top_outline, edge_types),
+                "position": {"x": right + max(width * 0.12, 0.012), "y": mid_y},
+            }
+        )
+    return specs
+
+
+def _display_dimension_count(items: list[dict[str, Any]]) -> int:
+    """Count real SolidWorks display dimensions in a mixed dimension evidence list."""
+
+    return len([item for item in items if item.get("is_display_dimension") is not False])
+
+
+def _existing_model_assembly_note_dimension_items(
+    missing_dimensions: list[str],
+    view_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return geometry-readback note evidence for assembly dimensions that are not display dimensions."""
+
+    layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+    model_dimensions_mm = layout.get("model_dimensions_mm") if isinstance(layout, dict) else {}
+    axis_by_id = {
+        "overall_length": "x",
+        "overall_width": "y",
+        "overall_height": "z",
+    }
+    items: list[dict[str, Any]] = []
+    for dimension_id in missing_dimensions:
+        axis = axis_by_id.get(str(dimension_id))
+        if axis is None or not isinstance(model_dimensions_mm, dict):
+            continue
+        try:
+            value_mm = float(model_dimensions_mm.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            value_mm = 0.0
+        if value_mm <= 0:
+            continue
+        items.append(
+            {
+                "id": str(dimension_id),
+                "method": "model_bbox_readback_note",
+                "is_display_dimension": False,
+                "classification": "geometry_readback_note",
+                "annotation_kind": "existing_model_assembly_overall_size_note",
+                "proxy_dimension": False,
+                "value_mm": round(value_mm, 3),
+                "axis": axis,
+            }
+        )
+    return items
+
+
+def _positive_model_dimension(model_dimensions: Any, axis: str) -> float:
+    """Return a positive model dimension in meters, or zero when unavailable."""
+
+    if not isinstance(model_dimensions, dict):
+        return 0.0
+    try:
+        value = float(model_dimensions.get(axis) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
 
 
 def _existing_model_bbox_sketch_dimension_specs(view_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -13414,11 +13908,17 @@ def _read_model_bounding_box(model: Any) -> dict[str, Any]:
             "attempts": attempts,
         }
 
-    for method_name in ("GetPartBox", "GetBox"):
+    fallback_calls = (
+        ("GetPartBox", (True,)),
+        ("GetBox", ()),
+        ("GetBox", (True,)),
+        ("GetBox", (False,)),
+    )
+    for method_name, args in fallback_calls:
         try:
             method = getattr(model, method_name)
-            box = _coerce_bounding_box(method(True) if method_name == "GetPartBox" else method())
-            attempts.append({"method": f"ModelDoc2.{method_name}", "ok": box is not None})
+            box = _coerce_bounding_box(method(*args))
+            attempts.append({"method": f"ModelDoc2.{method_name}", "args": list(args), "ok": box is not None})
             if box is not None:
                 return {
                     "status": "read",
@@ -13428,7 +13928,9 @@ def _read_model_bounding_box(model: Any) -> dict[str, Any]:
                     "attempts": attempts,
                 }
         except Exception as exc:
-            attempts.append({"method": f"ModelDoc2.{method_name}", "ok": False, "error": str(exc)})
+            attempts.append(
+                {"method": f"ModelDoc2.{method_name}", "args": list(args), "ok": False, "error": str(exc)}
+            )
 
     return {
         "status": "geometry_readback_failed",

@@ -382,12 +382,27 @@ class MockCADAdapter(CADAdapter):
             "copied_to_run_dir": bool(params.get("copy_to_run_dir", True)),
             "document_type": params["document_type"],
             "source_name": params["source_name"],
+            "reference_copy_result": {
+                "status": "references_copied" if params.get("reference_search_paths") else "not_requested",
+                "search_paths": list(params.get("reference_search_paths", [])),
+                "copied_count": len(params.get("reference_search_paths", [])),
+            },
         }
+        if params["document_type"] == "assembly":
+            self._existing_model_result["assembly_resolution"] = {
+                "status": "assembly_components_resolved",
+                "component_count": 3,
+                "active_component_count": 3,
+                "suppressed_component_count": 0,
+                "missing_path_count": 0,
+                "resolved_path_count": 3,
+                "run_dir_component_count": 3,
+            }
         self._model_geometry_status = "geometry_verified"
         self._model_geometry_result = {
             "status": "geometry_verified",
             "workflow": "existing_model",
-            "body_count": 1,
+            "body_count": 3 if params["document_type"] == "assembly" else 1,
             "bbox_m": [0.0, 0.0, 0.0, 0.086, 0.042, 0.042],
             "measured_dimensions_mm": measured_dimensions_mm,
             "checks": {
@@ -395,6 +410,8 @@ class MockCADAdapter(CADAdapter):
                 "copied_to_run_dir": True,
                 "bbox_dimensions_positive": True,
                 "body_count_positive": True,
+                "assembly_components_resolved": params["document_type"] != "assembly"
+                or self._existing_model_result["assembly_resolution"]["status"] == "assembly_components_resolved",
             },
         }
         self._mass_property_status = "mass_properties_verified"
@@ -1195,7 +1212,9 @@ class MockCADAdapter(CADAdapter):
         workspace = self._require_workspace()
         self._drawing_view_status = "created"
         existing_model = existing_model_parameters_from_plan(plan)
-        if existing_model is not None:
+        if existing_model is not None and existing_model.get("document_type") == "assembly":
+            self._drawing_view_result = _mock_existing_model_assembly_view_result()
+        elif existing_model is not None:
             self._drawing_view_result = _mock_manufacturing_rotational_view_result()
         else:
             self._drawing_view_result = _mock_standard_drawing_view_result()
@@ -1430,9 +1449,12 @@ class MockCADAdapter(CADAdapter):
         workspace = self._require_workspace() / "previews"
         workspace.mkdir(parents=True, exist_ok=True)
         previews: dict[str, str] = {}
+        existing_model = existing_model_parameters_from_plan(plan)
         view_names = (
-            ("section", "end", "isometric")
-            if existing_model_parameters_from_plan(plan) is not None
+            ("front", "top", "right", "isometric")
+            if existing_model is not None and existing_model.get("document_type") == "assembly"
+            else ("section", "end", "isometric")
+            if existing_model is not None
             else ("front", "top", "right", "isometric")
         )
         for view_name in view_names:
@@ -1671,6 +1693,55 @@ def _mock_manufacturing_rotational_view_result() -> dict[str, Any]:
     }
 
 
+def _mock_existing_model_assembly_view_result() -> dict[str, Any]:
+    """Return deterministic drawing diagnostics for imported assemblies."""
+
+    layout = {
+        "status": "layout_verified",
+        "auto_layout": True,
+        "layout_style": "existing_model_assembly",
+        "projection": "first_angle",
+        "sheet_size_m": {"width": 0.420, "height": 0.297},
+        "safe_rect_m": {"left": 0.020, "bottom": 0.070, "right": 0.400, "top": 0.277},
+        "scale": 0.5,
+        "model_dimensions_mm": {"x": 86.0, "y": 42.0, "z": 42.0},
+        "clipped_view_count": 0,
+        "verified_view_count": 4,
+        "clipped_views": [],
+    }
+    views = [
+        {"role": "front", "name": "*Front", "x": 0.115, "y": 0.125, "scale": 0.5},
+        {"role": "top", "name": "*Top", "x": 0.115, "y": 0.225, "scale": 0.5},
+        {"role": "right", "name": "*Right", "x": 0.305, "y": 0.125, "scale": 0.5},
+        {"role": "isometric", "name": "*Isometric", "x": 0.305, "y": 0.225, "scale": 0.5},
+    ]
+    for view in views:
+        view["outline"] = [view["x"] - 0.030, view["y"] - 0.022, view["x"] + 0.030, view["y"] + 0.022]
+        view["outline_source"] = "mock_existing_model_assembly_layout"
+    layout["verified_views"] = [
+        {
+            "role": view["role"],
+            "outline": view["outline"],
+            "outline_source": view["outline_source"],
+            "inside_safe_rect": True,
+        }
+        for view in views
+    ]
+    return {
+        "status": "created",
+        "views": views,
+        "created_count": len(views),
+        "required_roles": [view["role"] for view in views],
+        "missing_roles": [],
+        "layout": layout,
+        "assembly_draft": {
+            "status": "existing_model_assembly_draft_created",
+            "classification": "imported_assembly_draft",
+        },
+        "errors": [],
+    }
+
+
 def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> dict[str, Any]:
     """Return deterministic MVP drawing-dimension diagnostics for mock smoke."""
 
@@ -1687,8 +1758,13 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
         }
 
     existing_model_required = set(required) == {"overall_outer_diameter", "inner_diameter", "overall_length"}
+    existing_assembly_required = set(required) == {"overall_length", "overall_width", "overall_height"}
     dimension_layout_status = (
-        "existing_model_manufacturing_dimensions_created" if existing_model_required else "trusted_dimensions_created"
+        "existing_model_assembly_dimensions_created"
+        if existing_assembly_required
+        else "existing_model_manufacturing_dimensions_created"
+        if existing_model_required
+        else "trusted_dimensions_created"
     )
     return {
         "status": "basic_dimensions_created",
@@ -1703,12 +1779,18 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
                     if dimension_id == "inner_diameter"
                     else "mock_existing_model_overall_length"
                     if dimension_id == "overall_length"
+                    else "mock_existing_model_overall_width"
+                    if dimension_id == "overall_width"
+                    else "mock_existing_model_overall_height"
+                    if dimension_id == "overall_height"
                     else "AddRadialDimension2"
                     if dimension_id.startswith("corner_radius_")
                     else "mock_display_dimension"
                 ),
                 "classification": (
-                    "geometry_verified_dimension" if existing_model_required else "controlled_workflow_dimension"
+                    "geometry_verified_dimension"
+                    if existing_model_required or existing_assembly_required
+                    else "controlled_workflow_dimension"
                 ),
                 "is_display_dimension": True,
                 "annotation_kind": None,
@@ -1719,7 +1801,7 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
         "created_dimension_count": len(required),
         "missing_dimensions": [],
         "display_dimension_count": len(required),
-        "geometry_verified_dimension_count": len(required) if existing_model_required else 0,
+        "geometry_verified_dimension_count": len(required) if existing_model_required or existing_assembly_required else 0,
         "overall_note_created": False,
         "dimension_layout_status": dimension_layout_status,
         "attempts": [
@@ -1733,6 +1815,10 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
                     if dimension_id == "inner_diameter"
                     else "mock_existing_model_overall_length"
                     if dimension_id == "overall_length"
+                    else "mock_existing_model_overall_width"
+                    if dimension_id == "overall_width"
+                    else "mock_existing_model_overall_height"
+                    if dimension_id == "overall_height"
                     else "AddRadialDimension2"
                     if dimension_id.startswith("corner_radius_")
                     else "mock_display_dimension"
@@ -1746,7 +1832,10 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
 def _mock_required_basic_dimension_ids(plan: ModelPlan) -> list[str]:
     """Return the mock required drawing dimensions for the controlled workflow."""
 
-    if existing_model_parameters_from_plan(plan) is not None:
+    existing_model = existing_model_parameters_from_plan(plan)
+    if existing_model is not None and existing_model.get("document_type") == "assembly":
+        return ["overall_length", "overall_width", "overall_height"]
+    if existing_model is not None:
         return ["overall_outer_diameter", "inner_diameter", "overall_length"]
     atomic_required = atomic_dimension_ids_from_metadata(plan.metadata)
     if atomic_required:
