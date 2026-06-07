@@ -35,6 +35,7 @@ SUPPORTED_EXPORT_FORMATS = {
 SUPPORTED_THREAD_STANDARDS = {"ISO_metric_coarse"}
 SUPPORTED_THREAD_SPECS = {"M3", "M4", "M5", "M6", "M8"}
 SUPPORTED_SEMANTIC_SELECTORS = {"top_face", "outer_edges"}
+SUPPORTED_DRAWING_VIEW_STYLES = {"standard", "manufacturing_rotational"}
 ISO_METRIC_COARSE_THREAD_GEOMETRY = {
     "M3": {"nominal_diameter": 3.0, "tap_drill_diameter": 2.5, "pitch": 0.5},
     "M4": {"nominal_diameter": 4.0, "tap_drill_diameter": 3.3, "pitch": 0.7},
@@ -97,6 +98,7 @@ class DrawingProfile:
     template_path: str | None = None
     sheet_format: str = "A3"
     projection: Literal["third_angle", "first_angle"] = "third_angle"
+    view_style: Literal["standard", "manufacturing_rotational"] = "standard"
     include_isometric: bool = True
     include_basic_dimensions: bool = True
     export_formats: tuple[str, ...] = ("pdf", "dwg")
@@ -124,12 +126,18 @@ class DrawingProfile:
         projection = raw.get("projection", "third_angle")
         if projection not in {"third_angle", "first_angle"}:
             raise PlanValidationError("drawing_profile.projection must be third_angle or first_angle")
+        view_style = raw.get("view_style", raw.get("style", "standard"))
+        if view_style not in SUPPORTED_DRAWING_VIEW_STYLES:
+            raise PlanValidationError(
+                "drawing_profile.view_style must be standard or manufacturing_rotational"
+            )
 
         return cls(
             enabled=bool(raw.get("enabled", True)),
             template_path=raw.get("template_path"),
             sheet_format=str(raw.get("sheet_format", "A3")),
             projection=projection,
+            view_style=view_style,
             include_isometric=bool(raw.get("include_isometric", True)),
             include_basic_dimensions=bool(raw.get("include_basic_dimensions", True)),
             export_formats=export_formats,
@@ -150,6 +158,7 @@ class DrawingProfile:
             "template_path": self.template_path,
             "sheet_format": self.sheet_format,
             "projection": self.projection,
+            "view_style": self.view_style,
             "include_isometric": self.include_isometric,
             "include_basic_dimensions": self.include_basic_dimensions,
             "export_formats": list(self.export_formats),

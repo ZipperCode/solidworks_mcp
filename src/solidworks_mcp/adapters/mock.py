@@ -1194,9 +1194,13 @@ class MockCADAdapter(CADAdapter):
 
         workspace = self._require_workspace()
         self._drawing_view_status = "created"
-        self._drawing_view_result = _mock_standard_drawing_view_result()
+        existing_model = existing_model_parameters_from_plan(plan)
+        if existing_model is not None:
+            self._drawing_view_result = _mock_manufacturing_rotational_view_result()
+        else:
+            self._drawing_view_result = _mock_standard_drawing_view_result()
         self.record_event("drawing.standard_views", "completed", self._drawing_view_result)
-        if existing_model_parameters_from_plan(plan) is not None:
+        if existing_model is not None:
             self._drawing_annotation_status = "not_requested"
             self._drawing_annotation_result = {
                 "status": "not_requested",
@@ -1237,23 +1241,25 @@ class MockCADAdapter(CADAdapter):
             self._drawing_dimension_status = "not_requested"
             self._drawing_dimension_result = {"status": "not_requested"}
         self._drawing_metadata_note_result = _mock_metadata_note_result(plan)
-        if existing_model_parameters_from_plan(plan) is not None:
+        if existing_model is not None:
             self._drawing_metadata_note_result = {
-                "status": "existing_model_note_created",
+                "status": "manufacturing_note_created",
                 "custom_property_note": self._drawing_metadata_note_result,
-                "existing_model_note": {
-                    "status": "existing_model_note_created",
+                "manufacturing_note": {
+                    "status": "manufacturing_note_created",
                     "method": "mock_create_text",
                     "text": (
-                        "Source: mock existing model\n"
-                        "Overall size: X 86.00 mm / Y 42.00 mm / Z 42.00 mm\n"
-                        "Dimension evidence: display diameter + model bounding-box note"
+                        "本图基于导入三维模型自动生成。\n"
+                        "未注明尺寸由导入三维模型几何读取，仅供审图/加工前确认。\n"
+                        "未注公差、材料、表面处理按人工补充文件或订单要求执行。\n"
+                        "关键尺寸/公差需人工确认后方可生产放行。\n"
+                        "Imported model draft; dimensions, tolerances, material and surface finish require manual confirmation."
                     ),
                 },
             }
         if self._drawing_metadata_note_result["status"] == "metadata_note_created":
             self.record_event("drawing.metadata_note", "completed", self._drawing_metadata_note_result)
-        if self._drawing_metadata_note_result["status"] == "existing_model_note_created":
+        if self._drawing_metadata_note_result["status"] == "manufacturing_note_created":
             self.record_event("drawing.existing_model_note", "completed", self._drawing_metadata_note_result)
         drawing_path = workspace / "exports" / f"{safe_output_name(plan.name)}.drawing.json"
         drawing_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1424,7 +1430,12 @@ class MockCADAdapter(CADAdapter):
         workspace = self._require_workspace() / "previews"
         workspace.mkdir(parents=True, exist_ok=True)
         previews: dict[str, str] = {}
-        for view_name in ("front", "top", "right", "isometric"):
+        view_names = (
+            ("section", "end", "isometric")
+            if existing_model_parameters_from_plan(plan) is not None
+            else ("front", "top", "right", "isometric")
+        )
+        for view_name in view_names:
             preview_path = workspace / f"{safe_output_name(plan.name)}_{view_name}_preview.txt"
             preview_path.write_text(
                 f"Mock {view_name} preview for {plan.name}\n",
@@ -1582,6 +1593,84 @@ def _mock_standard_drawing_view_result() -> dict[str, Any]:
     }
 
 
+def _mock_manufacturing_rotational_view_result() -> dict[str, Any]:
+    """Return deterministic manufacturing-draft diagnostics for imported rotational parts."""
+
+    layout = {
+        "status": "layout_verified",
+        "auto_layout": True,
+        "layout_style": "manufacturing_rotational",
+        "projection": "first_angle",
+        "sheet_size_m": {"width": 0.420, "height": 0.297},
+        "safe_rect_m": {"left": 0.020, "bottom": 0.070, "right": 0.400, "top": 0.277},
+        "scale": 2.0,
+        "model_dimensions_mm": {"x": 50.5, "y": 21.5, "z": 50.5},
+        "clipped_view_count": 0,
+        "verified_view_count": 3,
+        "clipped_views": [],
+    }
+    views = [
+        {
+            "role": "section",
+            "name": "A-A",
+            "x": 0.145,
+            "y": 0.165,
+            "scale": 2.0,
+            "outline": [0.060, 0.105, 0.230, 0.225],
+            "outline_source": "mock_manufacturing_layout",
+        },
+        {
+            "role": "end",
+            "name": "*Front",
+            "x": 0.310,
+            "y": 0.205,
+            "scale": 2.0,
+            "outline": [0.270, 0.165, 0.350, 0.245],
+            "outline_source": "mock_manufacturing_layout",
+        },
+        {
+            "role": "isometric",
+            "name": "*Isometric",
+            "x": 0.318,
+            "y": 0.120,
+            "scale": 1.2,
+            "outline": [0.275, 0.085, 0.361, 0.155],
+            "outline_source": "mock_manufacturing_layout",
+        },
+    ]
+    layout["verified_views"] = [
+        {
+            "role": view["role"],
+            "outline": view["outline"],
+            "outline_source": view["outline_source"],
+            "inside_safe_rect": True,
+        }
+        for view in views
+    ]
+    return {
+        "status": "created",
+        "views": views,
+        "created_count": len(views),
+        "required_roles": [view["role"] for view in views],
+        "missing_roles": [],
+        "layout": layout,
+        "manufacturing_draft": {
+            "status": "existing_model_manufacturing_draft_created",
+            "classification": "imported_rotational_machining_draft",
+            "rotational_axis": {"status": "axis_verified", "confidence": 0.92, "axis": "z"},
+            "section_view": {
+                "status": "section_view_created",
+                "method": "CreateSectionViewAt5",
+                "section_object_verified": True,
+                "hatching_verified": True,
+            },
+            "centerline": {"status": "centerline_created", "centerline_count": 1},
+            "center_mark": {"status": "center_mark_created", "center_mark_count": 2},
+        },
+        "errors": [],
+    }
+
+
 def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> dict[str, Any]:
     """Return deterministic MVP drawing-dimension diagnostics for mock smoke."""
 
@@ -1597,9 +1686,9 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
             "attempts": [],
         }
 
-    existing_model_required = set(required) == {"overall_outer_diameter", "overall_size_note"}
+    existing_model_required = set(required) == {"overall_outer_diameter", "inner_diameter", "overall_length"}
     dimension_layout_status = (
-        "existing_model_overall_annotations_created" if existing_model_required else "trusted_dimensions_created"
+        "existing_model_manufacturing_dimensions_created" if existing_model_required else "trusted_dimensions_created"
     )
     return {
         "status": "basic_dimensions_created",
@@ -1608,35 +1697,42 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
             {
                 "id": dimension_id,
                 "method": (
-                    "mock_existing_model_overall_note"
-                    if dimension_id == "overall_size_note"
-                    else "mock_existing_model_outer_diameter"
+                    "mock_existing_model_outer_diameter"
                     if dimension_id == "overall_outer_diameter"
+                    else "mock_existing_model_inner_diameter"
+                    if dimension_id == "inner_diameter"
+                    else "mock_existing_model_overall_length"
+                    if dimension_id == "overall_length"
                     else "AddRadialDimension2"
                     if dimension_id.startswith("corner_radius_")
                     else "mock_display_dimension"
                 ),
-                "is_display_dimension": dimension_id != "overall_size_note",
-                "annotation_kind": (
-                    "existing_model_overall_size_note" if dimension_id == "overall_size_note" else None
+                "classification": (
+                    "geometry_verified_dimension" if existing_model_required else "controlled_workflow_dimension"
                 ),
+                "is_display_dimension": True,
+                "annotation_kind": None,
+                "proxy_dimension": False,
             }
             for dimension_id in required
         ],
         "created_dimension_count": len(required),
         "missing_dimensions": [],
-        "display_dimension_count": 1 if existing_model_required else len(required),
-        "overall_note_created": existing_model_required,
+        "display_dimension_count": len(required),
+        "geometry_verified_dimension_count": len(required) if existing_model_required else 0,
+        "overall_note_created": False,
         "dimension_layout_status": dimension_layout_status,
         "attempts": [
             {
                 "id": dimension_id,
                 "created": True,
                 "method": (
-                    "mock_existing_model_overall_note"
-                    if dimension_id == "overall_size_note"
-                    else "mock_existing_model_outer_diameter"
+                    "mock_existing_model_outer_diameter"
                     if dimension_id == "overall_outer_diameter"
+                    else "mock_existing_model_inner_diameter"
+                    if dimension_id == "inner_diameter"
+                    else "mock_existing_model_overall_length"
+                    if dimension_id == "overall_length"
                     else "AddRadialDimension2"
                     if dimension_id.startswith("corner_radius_")
                     else "mock_display_dimension"
@@ -1651,7 +1747,7 @@ def _mock_required_basic_dimension_ids(plan: ModelPlan) -> list[str]:
     """Return the mock required drawing dimensions for the controlled workflow."""
 
     if existing_model_parameters_from_plan(plan) is not None:
-        return ["overall_outer_diameter", "overall_size_note"]
+        return ["overall_outer_diameter", "inner_diameter", "overall_length"]
     atomic_required = atomic_dimension_ids_from_metadata(plan.metadata)
     if atomic_required:
         return atomic_required

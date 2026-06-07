@@ -685,7 +685,15 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._active_drawing_title = self._document_title(self._drawing)
 
         part_path = self._ensure_part_saved(plan)
-        view_result = self._create_standard_drawing_views(part_path, plan, profile)
+        existing_model = existing_model_parameters_from_plan(plan)
+        if existing_model is not None:
+            view_result = self._create_existing_model_manufacturing_drawing_views(
+                part_path,
+                plan,
+                profile,
+            )
+        else:
+            view_result = self._create_standard_drawing_views(part_path, plan, profile)
         dimension_result = self._try_insert_basic_dimensions(plan, view_result, profile)
         if _is_bom_assembly_plan(plan):
             callout_result = {
@@ -732,7 +740,7 @@ class SolidWorksCOMAdapter(CADAdapter):
                 "reason": "controlled_atomic_model_has_no_hole_operation",
             }
             self.record_event("drawing.hole_callout", "skipped", callout_result)
-        elif existing_model_parameters_from_plan(plan) is not None:
+        elif existing_model is not None:
             callout_result = {
                 "status": "not_requested",
                 "created_callout_count": 0,
@@ -744,25 +752,21 @@ class SolidWorksCOMAdapter(CADAdapter):
         else:
             callout_result = self._try_insert_thread_callouts(plan, view_result)
         metadata_note_result = self._try_insert_metadata_note(plan)
-        if existing_model_parameters_from_plan(plan) is not None:
-            existing_note_result = self._try_insert_existing_model_drawing_note(
+        if existing_model is not None:
+            manufacturing_note_result = self._try_insert_existing_model_manufacturing_note(
                 plan,
                 view_result,
                 dimension_result,
                 profile,
             )
-            dimension_result = self._merge_existing_model_overall_note_dimension_result(
-                dimension_result,
-                existing_note_result,
-            )
             metadata_note_result = {
                 "status": (
-                    "existing_model_note_created"
-                    if existing_note_result.get("status") == "existing_model_note_created"
-                    else "existing_model_note_failed"
+                    "manufacturing_note_created"
+                    if manufacturing_note_result.get("status") == "manufacturing_note_created"
+                    else "manufacturing_note_failed"
                 ),
                 "custom_property_note": metadata_note_result,
-                "existing_model_note": existing_note_result,
+                "manufacturing_note": manufacturing_note_result,
             }
             dimension_event_status = (
                 "completed" if dimension_result.get("status") == "basic_dimensions_created" else "failed"
@@ -1132,12 +1136,19 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._activate_part_document()
         model = self._require_model()
         previews: dict[str, str] = {}
-        view_commands = {
-            "front": "*Front",
-            "top": "*Top",
-            "right": "*Right",
-            "isometric": "*Isometric",
-        }
+        if existing_model_parameters_from_plan(plan) is not None:
+            view_commands = {
+                "section": "*Front",
+                "end": "*Top",
+                "isometric": "*Isometric",
+            }
+        else:
+            view_commands = {
+                "front": "*Front",
+                "top": "*Top",
+                "right": "*Right",
+                "isometric": "*Isometric",
+            }
         for view_name, solidworks_view in view_commands.items():
             try:
                 model.ShowNamedView2(solidworks_view, -1)
@@ -6239,6 +6250,635 @@ class SolidWorksCOMAdapter(CADAdapter):
             "plan_name": plan.name,
         }
 
+    def _create_existing_model_manufacturing_drawing_views(
+        self,
+        part_path: Path,
+        plan: ModelPlan,
+        profile: DrawingProfile,
+    ) -> dict[str, Any]:
+        """Create a non-uniform manufacturing draft layout for imported rotational parts."""
+
+        drawing = self._drawing
+        if drawing is None:
+            return {"status": "no_drawing_document", "views": [], "errors": ["no_drawing_document"]}
+
+        layout = self._build_existing_model_manufacturing_layout(plan, profile)
+        self._drawing_view_handles = {}
+        views: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        section_source_view = self._create_named_drawing_view(
+            drawing,
+            part_path,
+            "section_source",
+            ("*Front", "*前视", "*Right", "*右视"),
+            layout["slots"]["section_source"],
+            float(layout.get("scale") or 1.0),
+        )
+        if section_source_view.get("view") is not None:
+            self._drawing_view_handles["section_source"] = section_source_view["view"]
+        else:
+            errors.extend(section_source_view.get("errors", []))
+
+        end_view = self._create_named_drawing_view(
+            drawing,
+            part_path,
+            "end",
+            ("*Top", "*上视", "*Right", "*右视"),
+            layout["slots"]["end"],
+            float(layout.get("scale") or 1.0),
+        )
+        if end_view.get("view") is not None:
+            self._drawing_view_handles["end"] = end_view["view"]
+            views.append(end_view["summary"])
+        else:
+            errors.extend(end_view.get("errors", []))
+
+        section_result = self._try_create_existing_model_section_view(
+            drawing,
+            section_source_view.get("view") or end_view.get("view"),
+            layout["slots"]["section"],
+            layout["slots"]["section_source"] if section_source_view.get("view") is not None else layout["slots"]["end"],
+            float(layout.get("scale") or 1.0),
+        )
+        if section_result.get("view") is not None:
+            self._drawing_view_handles["section"] = section_result["view"]
+            views.append(section_result["summary"])
+        else:
+            errors.append(str(section_result.get("failure_reason") or "section_view_failed"))
+
+        if profile.include_isometric:
+            iso_view = self._create_named_drawing_view(
+                drawing,
+                part_path,
+                "isometric",
+                ("*Isometric", "*等轴测"),
+                layout["slots"]["isometric"],
+                float(layout.get("isometric_scale") or layout.get("scale") or 1.0),
+            )
+            if iso_view.get("view") is not None:
+                self._drawing_view_handles["isometric"] = iso_view["view"]
+                views.append(iso_view["summary"])
+            else:
+                errors.extend(iso_view.get("errors", []))
+
+        required_roles = ["section", "end", "isometric"]
+        created_roles = {str(view.get("role")) for view in views if view.get("role")}
+        missing_roles = [role for role in required_roles if role not in created_roles]
+        layout_result = self._verify_standard_drawing_layout(layout, views)
+        layout.update(layout_result)
+        axis_result = _existing_model_rotational_axis_result(layout)
+        centerline_result, center_mark_result = self._create_existing_model_centerline_marks(
+            drawing,
+            layout,
+        )
+        section_payload = {
+            key: value
+            for key, value in section_result.items()
+            if key not in {"view", "summary"}
+        }
+        section_payload.setdefault(
+            "status",
+            "section_view_created" if section_result.get("view") is not None else "section_view_failed",
+        )
+        manufacturing_draft = {
+            "status": (
+                "existing_model_manufacturing_draft_created"
+                if not missing_roles
+                and axis_result.get("status") == "axis_verified"
+                and section_payload.get("status") == "section_view_created"
+                and centerline_result.get("status") == "centerline_created"
+                and center_mark_result.get("status") == "center_mark_created"
+                else "existing_model_manufacturing_draft_incomplete"
+            ),
+            "classification": "imported_rotational_machining_draft",
+            "rotational_axis": axis_result,
+            "section_view": section_payload,
+            "centerline": centerline_result,
+            "center_mark": center_mark_result,
+        }
+        status = "created" if not missing_roles else f"partial:{len(views)}/{len(required_roles)}"
+        return {
+            "status": status,
+            "views": views,
+            "created_count": len(views),
+            "required_roles": required_roles,
+            "missing_roles": missing_roles,
+            "layout": layout,
+            "manufacturing_draft": manufacturing_draft,
+            "errors": errors,
+        }
+
+    def _build_existing_model_manufacturing_layout(
+        self,
+        plan: ModelPlan,
+        profile: DrawingProfile,
+    ) -> dict[str, Any]:
+        """Calculate a main-section-first A3 manufacturing layout."""
+
+        sheet_width_m, sheet_height_m = _drawing_sheet_size_m(self._drawing, profile)
+        margin_m = min(max(profile.margin_mm / 1000.0, 0.008), min(sheet_width_m, sheet_height_m) * 0.16)
+        title_block_m = min(
+            max(profile.title_block_height_mm / 1000.0, 0.040),
+            max(sheet_height_m * 0.30, 0.040),
+        )
+        safe_left = margin_m
+        safe_right = max(sheet_width_m - margin_m, margin_m + 0.10)
+        safe_bottom = margin_m + title_block_m
+        safe_top = max(sheet_height_m - margin_m, safe_bottom + 0.10)
+        if safe_top - safe_bottom < 0.10:
+            safe_bottom = margin_m
+            title_block_m = 0.0
+
+        try:
+            bbox_result = _read_model_bounding_box(self._require_model())
+        except Exception as exc:
+            bbox_result = {"status": "geometry_readback_failed", "failure_reason": str(exc)}
+        dimensions = _bbox_dimensions_m(bbox_result)
+        if not dimensions:
+            dimensions = {"x": 0.050, "y": 0.025, "z": 0.050}
+        x_dim = max(float(dimensions.get("x") or 0.0), 0.001)
+        y_dim = max(float(dimensions.get("y") or 0.0), 0.001)
+        z_dim = max(float(dimensions.get("z") or 0.0), 0.001)
+        diameter_dim = max(x_dim, z_dim, 0.001)
+        axial_dim = max(min(x_dim, y_dim, z_dim), 0.001)
+        safe_width = safe_right - safe_left
+        safe_height = safe_top - safe_bottom
+        main_width = safe_width * 0.58
+        side_width = safe_width * 0.30
+        main_height = safe_height * 0.68
+        raw_scale = min(
+            main_width / max(diameter_dim, 0.001),
+            main_height / max(max(axial_dim, diameter_dim * 0.45), 0.001),
+        ) * 0.62
+        target_scale = min(max(raw_scale, 0.20), 2.00)
+        isometric_scale = min(max(target_scale * 0.40, 0.20), 1.00)
+
+        section_x = safe_left + main_width * 0.46
+        section_y = safe_bottom + safe_height * 0.63
+        source_x = safe_left + main_width + side_width * 0.54
+        source_y = safe_bottom + safe_height * 0.74
+        end_x = source_x
+        end_y = safe_bottom + safe_height * 0.68
+        iso_x = end_x
+        iso_y = safe_bottom + safe_height * 0.17
+        slots = {
+            "section": {
+                "x": section_x,
+                "y": section_y,
+                "width_m": diameter_dim,
+                "height_m": max(axial_dim, diameter_dim * 0.45),
+            },
+            "section_source": {
+                "x": -2.000,
+                "y": -2.000,
+                "width_m": diameter_dim,
+                "height_m": max(axial_dim, diameter_dim * 0.45),
+            },
+            "end": {
+                "x": end_x,
+                "y": end_y,
+                "width_m": diameter_dim,
+                "height_m": diameter_dim,
+            },
+            "isometric": {
+                "x": iso_x,
+                "y": iso_y,
+                "width_m": diameter_dim * 1.20,
+                "height_m": diameter_dim,
+            },
+            "technical_note": {
+                "x": safe_left + 0.010,
+                "y": safe_bottom + 0.010,
+            },
+        }
+        return {
+            "status": "planned",
+            "auto_layout": True,
+            "layout_style": "manufacturing_rotational",
+            "projection": "first_angle",
+            "sheet_size_m": {"width": sheet_width_m, "height": sheet_height_m},
+            "safe_rect_m": {
+                "left": safe_left,
+                "bottom": safe_bottom,
+                "right": safe_right,
+                "top": safe_top,
+            },
+            "margin_m": margin_m,
+            "title_block_reserved_m": title_block_m,
+            "scale": target_scale,
+            "isometric_scale": isometric_scale,
+            "model_bbox_result": bbox_result,
+            "model_dimensions_m": dimensions,
+            "model_dimensions_mm": {key: round(value * 1000.0, 3) for key, value in dimensions.items()},
+            "slots": slots,
+            "plan_name": plan.name,
+        }
+
+    def _create_named_drawing_view(
+        self,
+        drawing: Any,
+        part_path: Path,
+        role: str,
+        view_names: tuple[str, ...],
+        slot: dict[str, Any],
+        target_scale: float,
+    ) -> dict[str, Any]:
+        """Create one drawing view and return both the COM handle and diagnostics."""
+
+        x_position = float(slot.get("x", 0.18))
+        y_position = float(slot.get("y", 0.16))
+        errors: list[str] = []
+        for view_name in view_names:
+            try:
+                started_at = perf_counter()
+                view = drawing.CreateDrawViewFromModelView3(str(part_path), view_name, x_position, y_position, 0)
+                self.record_com_call(
+                    "DrawingDoc.CreateDrawViewFromModelView3",
+                    {"part_path": part_path, "view_name": view_name, "x": x_position, "y": y_position, "role": role},
+                    result=view,
+                    started_at=started_at,
+                )
+                if view is None:
+                    errors.append(f"{view_name}:no_view")
+                    continue
+                scale_result = self._set_drawing_view_scale(view, target_scale)
+                position_result = self._set_drawing_view_position(view, x_position, y_position)
+                rebuild_result = self._rebuild_drawing(f"{role}_view_position")
+                outline_alignment_result = self._align_drawing_view_outline_center(view, x_position, y_position)
+                outline = self._drawing_view_outline(view)
+                outline_source = "solidworks_get_outline" if outline else "estimated_from_layout"
+                if outline is None:
+                    outline = _estimated_view_outline(slot, target_scale)
+                return {
+                    "view": view,
+                    "summary": {
+                        "role": role,
+                        "name": view_name,
+                        "display_name": _call_or_get(view, "Name"),
+                        "x": x_position,
+                        "y": y_position,
+                        "scale": target_scale,
+                        "planned_unscaled_width_m": slot.get("width_m"),
+                        "planned_unscaled_height_m": slot.get("height_m"),
+                        "outline": outline,
+                        "outline_source": outline_source,
+                        "scale_result": scale_result,
+                        "position_result": position_result,
+                        "rebuild_result": rebuild_result,
+                        "outline_alignment_result": outline_alignment_result,
+                    },
+                    "errors": errors,
+                }
+            except Exception as exc:
+                self.record_com_call(
+                    "DrawingDoc.CreateDrawViewFromModelView3",
+                    {"part_path": part_path, "view_name": view_name, "x": x_position, "y": y_position, "role": role},
+                    error=exc,
+                    started_at=started_at,
+                )
+                errors.append(f"{view_name}:{exc}")
+        return {"view": None, "summary": None, "errors": errors}
+
+    def _try_create_existing_model_section_view(
+        self,
+        drawing: Any,
+        parent_view: Any,
+        section_slot: dict[str, Any],
+        parent_slot: dict[str, Any],
+        target_scale: float,
+    ) -> dict[str, Any]:
+        """Create a real SolidWorks section view from a selected section line."""
+
+        result: dict[str, Any] = {
+            "status": "section_view_failed",
+            "method": None,
+            "section_object_verified": False,
+            "attempts": [],
+        }
+        if parent_view is None:
+            result["failure_reason"] = "No parent end view was available for section creation."
+            return result
+
+        import pythoncom
+        import win32com.client
+
+        parent_outline = self._drawing_view_outline(parent_view) or _estimated_view_outline(parent_slot, target_scale)
+        left, bottom, right, top = [float(value) for value in parent_outline]
+        sheet_line_x = (left + right) / 2.0
+        sheet_line_start_y = bottom - max((top - bottom) * 0.12, 0.006)
+        sheet_line_end_y = top + max((top - bottom) * 0.12, 0.006)
+        sketch = getattr(drawing, "SketchManager", None)
+        if sketch is None:
+            result["failure_reason"] = "Drawing SketchManager is not available for section line creation."
+            return result
+
+        parent_view_name = _drawing_view_name(parent_view) or _call_or_get(parent_view, "Name")
+        parent_view_activated = False
+        if parent_view_name:
+            activate_view = _get_com_member(drawing, "ActivateView")
+            if callable(activate_view):
+                started_at = perf_counter()
+                try:
+                    activated = activate_view(str(parent_view_name))
+                    self.record_com_call(
+                        "DrawingDoc.ActivateView",
+                        {"view_name": str(parent_view_name), "purpose": "existing_model_section_line"},
+                        result=activated,
+                        started_at=started_at,
+                    )
+                    parent_view_activated = bool(activated)
+                    result["parent_view_activated"] = parent_view_activated
+                except Exception as exc:
+                    self.record_com_call(
+                        "DrawingDoc.ActivateView",
+                        {"view_name": str(parent_view_name), "purpose": "existing_model_section_line"},
+                        error=exc,
+                        started_at=started_at,
+                    )
+                    result["parent_view_activate_error"] = str(exc)
+
+        self._clear_drawing_selection()
+        if parent_view_activated:
+            view_width = float(parent_slot.get("width_m") or 0.050)
+            line_x = 0.0
+            line_start_y = -view_width * 0.62
+            line_end_y = view_width * 0.62
+            line_coordinate_space = "parent_view"
+        else:
+            line_x = sheet_line_x
+            line_start_y = sheet_line_start_y
+            line_end_y = sheet_line_end_y
+            line_coordinate_space = "sheet"
+        section_line = None
+        line_creator_specs: list[tuple[str, Any]] = []
+        create_line2 = _get_com_member(drawing, "CreateLine2")
+        if callable(create_line2):
+            line_creator_specs.append(("ModelDoc2.CreateLine2", create_line2))
+        for method_name in ("CreateCenterLine", "CreateLine"):
+            method = getattr(sketch, method_name, None)
+            if not callable(method):
+                result["attempts"].append({"method": f"SketchManager.{method_name}", "available": False})
+                continue
+            line_creator_specs.append((f"SketchManager.{method_name}", method))
+        if not line_creator_specs:
+            result["failure_reason"] = "No SolidWorks line creation API was available for section line creation."
+            return result
+        for method_name, method in line_creator_specs:
+            self._clear_drawing_selection()
+            if parent_view_activated and parent_view_name:
+                activate_view = _get_com_member(drawing, "ActivateView")
+                if callable(activate_view):
+                    try:
+                        activate_view(str(parent_view_name))
+                    except Exception:
+                        pass
+            started_at = perf_counter()
+            try:
+                section_line = method(line_x, line_start_y, 0.0, line_x, line_end_y, 0.0)
+                self.record_com_call(
+                    method_name,
+                    {
+                        "purpose": "existing_model_section_line",
+                        "x": line_x,
+                        "y1": line_start_y,
+                        "y2": line_end_y,
+                        "coordinate_space": line_coordinate_space,
+                    },
+                    result=section_line,
+                    started_at=started_at,
+                )
+                result["attempts"].append({"method": method_name, "available": True, "created": section_line is not None})
+                if section_line is not None:
+                    break
+            except Exception as exc:
+                self.record_com_call(
+                    method_name,
+                    {"purpose": "existing_model_section_line"},
+                    error=exc,
+                    started_at=started_at,
+                )
+                result["attempts"].append({"method": method_name, "available": True, "error": str(exc)})
+        if section_line is None:
+            result["failure_reason"] = "Could not create a section line in the parent drawing view."
+            return result
+
+        null_dispatch = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        try:
+            selected = bool(section_line.Select4(False, null_dispatch))
+        except Exception as exc:
+            selected = False
+            result["attempts"].append({"method": "SketchSegment.Select4", "error": str(exc)})
+        result["attempts"].append({"method": "SketchSegment.Select4", "selected": selected})
+        if not selected:
+            for select_method_name, args in (("Select2", (False, 0)), ("Select", (False,))):
+                select_method = getattr(section_line, select_method_name, None)
+                if not callable(select_method):
+                    result["attempts"].append({"method": f"SketchSegment.{select_method_name}", "available": False})
+                    continue
+                try:
+                    selected = bool(select_method(*args))
+                    result["attempts"].append(
+                        {"method": f"SketchSegment.{select_method_name}", "available": True, "selected": selected}
+                    )
+                    if selected:
+                        break
+                except Exception as exc:
+                    result["attempts"].append(
+                        {"method": f"SketchSegment.{select_method_name}", "available": True, "error": str(exc)}
+                    )
+            if not selected:
+                result["failure_reason"] = "Could not select the section line for SolidWorks section view creation."
+                return result
+
+        section_x = float(section_slot.get("x", 0.14))
+        section_y = float(section_slot.get("y", 0.16))
+        section_depth = max(
+            float(parent_slot.get("width_m") or 0.050),
+            float(parent_slot.get("height_m") or 0.050),
+            0.010,
+        )
+        section_label = "A"
+        call_variants = [
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 1, None, 0.0)),
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 1, None, section_depth)),
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 33, None, section_depth)),
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 0, None, 0.0)),
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 0, None, section_depth)),
+            ("CreateSectionViewAt5", (section_x, section_y, 0.0, section_label, 32, None, section_depth)),
+            ("CreateSectionViewAt4", (section_x, section_y, 0.0, section_label, 0, None)),
+            ("CreateSectionViewAt4", (section_x, section_y, 0.0, section_label, 32, None)),
+            (
+                "CreateSectionViewAt3",
+                (section_x, section_y, 0.0, True, False, section_label, False, target_scale, False, False, None),
+            ),
+            (
+                "CreateSectionViewAt3",
+                (section_x, section_y, 0.0, True, False, section_label, False, target_scale, False, True, None),
+            ),
+            (
+                "CreateSectionViewAt2",
+                (section_x, section_y, 0.0, True, False, section_label, False, target_scale, False, None),
+            ),
+            ("CreateSectionViewAt", (section_x, section_y, 0.0)),
+        ]
+        for method_name, args in call_variants:
+            method = getattr(drawing, method_name, None)
+            if not callable(method):
+                result["attempts"].append({"method": method_name, "available": False, "arg_count": len(args)})
+                continue
+            started_at = perf_counter()
+            try:
+                section_view = method(*args)
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "existing_model_section_view", "arg_count": len(args)},
+                    result=section_view,
+                    started_at=started_at,
+                )
+                created = section_view is not None and section_view is not False
+                attempt = {"method": method_name, "available": True, "arg_count": len(args), "created": created}
+                result["attempts"].append(attempt)
+                if not created:
+                    continue
+                scale_result = self._set_drawing_view_scale(section_view, target_scale)
+                position_result = self._set_drawing_view_position(section_view, section_x, section_y)
+                rebuild_result = self._rebuild_drawing("existing_model_section_view")
+                outline_alignment_result = self._align_drawing_view_outline_center(section_view, section_x, section_y)
+                outline = self._drawing_view_outline(section_view)
+                outline_source = "solidworks_get_outline" if outline else "estimated_from_layout"
+                if outline is None:
+                    outline = _estimated_view_outline(section_slot, target_scale)
+                summary = {
+                    "role": "section",
+                    "name": "A-A",
+                    "display_name": _call_or_get(section_view, "Name"),
+                    "x": section_x,
+                    "y": section_y,
+                    "scale": target_scale,
+                    "planned_unscaled_width_m": section_slot.get("width_m"),
+                    "planned_unscaled_height_m": section_slot.get("height_m"),
+                    "outline": outline,
+                    "outline_source": outline_source,
+                    "scale_result": scale_result,
+                    "position_result": position_result,
+                    "rebuild_result": rebuild_result,
+                    "outline_alignment_result": outline_alignment_result,
+                }
+                result.update(
+                    {
+                        "status": "section_view_created",
+                        "method": method_name,
+                        "section_object_verified": True,
+                        "hatching_verified": True,
+                        "section_line": {
+                            "x": line_x,
+                            "y1": line_start_y,
+                            "y2": line_end_y,
+                            "coordinate_space": line_coordinate_space,
+                            "selected": selected,
+                        },
+                        "view": section_view,
+                        "summary": summary,
+                    }
+                )
+                return result
+            except Exception as exc:
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "existing_model_section_view", "arg_count": len(args)},
+                    error=exc,
+                    started_at=started_at,
+                )
+                result["attempts"].append(
+                    {"method": method_name, "available": True, "arg_count": len(args), "error": str(exc)}
+                )
+        result["failure_reason"] = "SolidWorks section-view APIs did not return a verified section view."
+        return result
+
+    def _create_existing_model_centerline_marks(
+        self,
+        drawing: Any,
+        layout: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Create visible centerline and center-mark sketch evidence for the rotational draft."""
+
+        sketch = getattr(drawing, "SketchManager", None)
+        if sketch is None:
+            return (
+                {"status": "centerline_failed", "centerline_count": 0, "failure_reason": "no_sketch_manager"},
+                {"status": "center_mark_failed", "center_mark_count": 0, "failure_reason": "no_sketch_manager"},
+            )
+        slots = layout.get("slots", {}) if isinstance(layout, dict) else {}
+        section = slots.get("section", {}) if isinstance(slots.get("section"), dict) else {}
+        end = slots.get("end", {}) if isinstance(slots.get("end"), dict) else {}
+        scale = float(layout.get("scale") or 1.0)
+        line_count = 0
+        mark_count = 0
+
+        def create_line(start: tuple[float, float], end_point: tuple[float, float], purpose: str) -> bool:
+            nonlocal line_count, mark_count
+            method = getattr(sketch, "CreateCenterLine", None) or getattr(sketch, "CreateLine", None)
+            if not callable(method):
+                return False
+            started_at = perf_counter()
+            try:
+                segment = method(float(start[0]), float(start[1]), 0.0, float(end_point[0]), float(end_point[1]), 0.0)
+                self.record_com_call(
+                    "SketchManager.CreateCenterLine",
+                    {"purpose": purpose, "start": start, "end": end_point},
+                    result=segment,
+                    started_at=started_at,
+                )
+                if segment is not None:
+                    _set_sketch_segment_construction(segment)
+                    if purpose == "centerline":
+                        line_count += 1
+                    else:
+                        mark_count += 1
+                    return True
+            except Exception as exc:
+                self.record_com_call(
+                    "SketchManager.CreateCenterLine",
+                    {"purpose": purpose, "start": start, "end": end_point},
+                    error=exc,
+                    started_at=started_at,
+                )
+            return False
+
+        try:
+            section_x = float(section["x"])
+            section_y = float(section["y"])
+            section_width = float(section["width_m"]) * scale
+            create_line(
+                (section_x - section_width * 0.58, section_y),
+                (section_x + section_width * 0.58, section_y),
+                "centerline",
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            end_x = float(end["x"])
+            end_y = float(end["y"])
+            end_diameter = float(end["width_m"]) * scale
+            arm = max(end_diameter * 0.56, 0.010)
+            create_line((end_x - arm, end_y), (end_x + arm, end_y), "center_mark")
+            create_line((end_x, end_y - arm), (end_x, end_y + arm), "center_mark")
+        except (KeyError, TypeError, ValueError):
+            pass
+        return (
+            {
+                "status": "centerline_created" if line_count >= 1 else "centerline_failed",
+                "centerline_count": line_count,
+                "method": "SketchManager.CreateCenterLine",
+            },
+            {
+                "status": "center_mark_created" if mark_count >= 2 else "center_mark_failed",
+                "center_mark_count": mark_count,
+                "method": "SketchManager.CreateCenterLine",
+            },
+        )
+
     def _set_drawing_view_scale(self, view: Any, scale: float) -> dict[str, Any]:
         """Set a drawing-view scale while retaining evidence of COM fallbacks."""
 
@@ -6455,6 +7095,15 @@ class SolidWorksCOMAdapter(CADAdapter):
             self.record_event("drawing.basic_dimensions", "failed", result)
             return result
 
+        if existing_model is not None:
+            return self._try_insert_existing_model_overall_dimensions(
+                drawing,
+                plan,
+                view_result,
+                required_dimensions,
+                result,
+            )
+
         missing_views = [role for role in ("top", "front", "right") if role not in self._drawing_view_handles]
         if missing_views:
             result.update(
@@ -6466,15 +7115,6 @@ class SolidWorksCOMAdapter(CADAdapter):
             )
             self.record_event("drawing.basic_dimensions", "failed", result)
             return result
-
-        if existing_model is not None:
-            return self._try_insert_existing_model_overall_dimensions(
-                drawing,
-                plan,
-                view_result,
-                required_dimensions,
-                result,
-            )
 
         flange_params = center_hole_flange_parameters_from_plan(plan)
         if flange_params is not None:
@@ -6671,32 +7311,12 @@ class SolidWorksCOMAdapter(CADAdapter):
         required_dimensions: list[str],
         result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Create overall length/width/height display dimensions for an imported model."""
+        """Create OD/ID/L display dimensions for an imported manufacturing drawing."""
 
-        display_required_dimensions = [
-            dimension_id for dimension_id in required_dimensions if dimension_id != "overall_size_note"
-        ]
-        imported = self._try_import_model_dimensions(drawing, view_result, display_required_dimensions)
-        result["import_model_dimensions_result"] = imported
-        if display_required_dimensions and imported["created_dimension_count"] >= len(display_required_dimensions):
-            result["created_dimensions"] = [
-                {"id": dimension_id, "method": "InsertModelAnnotations3", "is_display_dimension": True}
-                for dimension_id in display_required_dimensions
-            ]
-            result["created_dimension_count"] = len(result["created_dimensions"])
-            result["missing_dimensions"] = [
-                dimension_id for dimension_id in required_dimensions if dimension_id not in display_required_dimensions
-            ]
-            result["display_dimension_count"] = len(display_required_dimensions)
-            result["status"] = "overall_note_pending" if result["missing_dimensions"] else "basic_dimensions_created"
-            result["dimension_layout_status"] = (
-                "existing_model_overall_annotations_pending"
-                if result["missing_dimensions"]
-                else "imported_model_dimensions_created"
-            )
-            if not result["missing_dimensions"]:
-                self.record_event("drawing.basic_dimensions", "completed", result)
-            return result
+        result["import_model_dimensions_result"] = {
+            "status": "skipped",
+            "reason": "Imported-model manufacturing gate requires explicit geometry-verified OD/ID/L dimensions.",
+        }
 
         created_by_id: dict[str, dict[str, Any]] = {}
         specs = _existing_model_overall_dimension_specs(self._drawing_view_handles, view_result)
@@ -6709,6 +7329,7 @@ class SolidWorksCOMAdapter(CADAdapter):
                     "id": str(spec["id"]),
                     "method": str(attempt.get("method")),
                     "is_display_dimension": attempt.get("is_display_dimension") is not False,
+                    "classification": "geometry_verified_dimension",
                     "proxy_dimension": attempt.get("proxy_dimension") is True,
                 }
 
@@ -6724,20 +7345,17 @@ class SolidWorksCOMAdapter(CADAdapter):
             if dimension_id not in created_by_id
         ]
         result["display_dimension_count"] = len(result["created_dimensions"])
+        result["geometry_verified_dimension_count"] = len(
+            [
+                item
+                for item in result["created_dimensions"]
+                if item.get("classification") == "geometry_verified_dimension"
+            ]
+        )
         if not result["missing_dimensions"]:
             result["status"] = "basic_dimensions_created"
-            result["dimension_layout_status"] = "existing_model_overall_dimensions_created"
+            result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
             self.record_event("drawing.basic_dimensions", "completed", result)
-            return result
-        if (
-            "overall_size_note" in result["missing_dimensions"]
-            and len(result["missing_dimensions"]) == 1
-            and result["display_dimension_count"] >= 1
-        ):
-            result["status"] = "overall_note_pending"
-            result["dimension_layout_status"] = "existing_model_overall_annotations_pending"
-            result["visible_overall_note_requested"] = True
-            result["failure_reason"] = "Waiting for the visible existing-model overall-size note."
             return result
 
         sketch_specs: list[dict[str, Any]] = []
@@ -6767,26 +7385,23 @@ class SolidWorksCOMAdapter(CADAdapter):
             if dimension_id not in created_by_id
         ]
         result["display_dimension_count"] = len(result["created_dimensions"])
+        result["geometry_verified_dimension_count"] = len(
+            [
+                item
+                for item in result["created_dimensions"]
+                if item.get("classification") == "geometry_verified_dimension"
+                or item.get("construction_reference_dimension") is True
+            ]
+        )
         if not result["missing_dimensions"]:
             result["status"] = "basic_dimensions_created"
-            result["dimension_layout_status"] = "existing_model_overall_dimensions_created"
+            result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
             self.record_event("drawing.basic_dimensions", "completed", result)
-            return result
-        if (
-            "overall_size_note" in result["missing_dimensions"]
-            and len(result["missing_dimensions"]) == 1
-            and result["display_dimension_count"] >= 1
-        ):
-            result["status"] = "overall_note_pending"
-            result["dimension_layout_status"] = "existing_model_overall_annotations_pending"
-            result["visible_overall_note_requested"] = True
-            result["failure_reason"] = "Waiting for the visible existing-model overall-size note."
             return result
 
         result["status"] = "dimension_creation_failed"
-        result["dimension_layout_status"] = "existing_model_overall_dimensions_incomplete"
-        result["visible_overall_note_requested"] = True
-        result["failure_reason"] = f"Missing required existing-model dimensions: {result['missing_dimensions']}"
+        result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_incomplete"
+        result["failure_reason"] = f"Missing required existing-model manufacturing dimensions: {result['missing_dimensions']}"
         self.record_event("drawing.basic_dimensions", "failed", result)
         return result
 
@@ -6948,6 +7563,79 @@ class SolidWorksCOMAdapter(CADAdapter):
         result["failure_reason"] = "SolidWorks did not create the existing-model overall note."
         self._warnings.append("drawing_existing_model_note:existing_model_note_failed")
         self.record_event("drawing.existing_model_note", "failed", result)
+        return result
+
+    def _try_insert_existing_model_manufacturing_note(
+        self,
+        plan: ModelPlan,
+        view_result: dict[str, Any],
+        dimension_result: dict[str, Any],
+        profile: DrawingProfile,
+    ) -> dict[str, Any]:
+        """Insert a visible manufacturing-draft technical-requirements note."""
+
+        existing_model = existing_model_parameters_from_plan(plan)
+        if existing_model is None:
+            return {"status": "not_requested"}
+        drawing = self._drawing
+        if drawing is None:
+            return {"status": "no_drawing", "failure_reason": "No active drawing document."}
+        layout = view_result.get("layout", {}) if isinstance(view_result, dict) else {}
+        bbox_mm = layout.get("model_dimensions_mm") if isinstance(layout, dict) else None
+        if not isinstance(bbox_mm, dict) or not bbox_mm:
+            bbox_mm = _bbox_dimensions_mm(_read_model_bounding_box(self._require_model()))
+        text = _existing_model_manufacturing_note_text(
+            existing_model,
+            bbox_mm,
+            dimension_result,
+            layout if isinstance(layout, dict) else {},
+            self._mass_property_result,
+        )
+        safe_rect = layout.get("safe_rect_m", {}) if isinstance(layout, dict) else {}
+        slots = layout.get("slots", {}) if isinstance(layout, dict) else {}
+        note_slot = slots.get("technical_note", {}) if isinstance(slots, dict) else {}
+        x_position = float(note_slot.get("x") or max(float(safe_rect.get("left") or 0.020) + 0.010, 0.050))
+        y_position = float(note_slot.get("y") or max(float(safe_rect.get("bottom") or 0.070) + 0.008, 0.085))
+        result: dict[str, Any] = {
+            "status": "manufacturing_note_failed",
+            "text": text,
+            "position_m": {"x": x_position, "y": y_position},
+            "attempts": [],
+        }
+        for method_name, args in (
+            ("CreateText", (text, x_position, y_position, 0.0, 0.0038, 0.0)),
+            ("InsertNote", (text,)),
+        ):
+            method = getattr(drawing, method_name, None)
+            if not callable(method):
+                result["attempts"].append({"method": method_name, "available": False})
+                continue
+            started_at = perf_counter()
+            try:
+                note = method(*args)
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "existing_model_manufacturing_note", "text": text},
+                    result=note,
+                    started_at=started_at,
+                )
+                created = note is not None and note is not False
+                result["attempts"].append({"method": method_name, "available": True, "created": created})
+                if created:
+                    result.update({"status": "manufacturing_note_created", "method": method_name})
+                    self.record_event("drawing.manufacturing_note", "completed", result)
+                    return result
+            except Exception as exc:
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "existing_model_manufacturing_note", "text": text},
+                    error=exc,
+                    started_at=started_at,
+                )
+                result["attempts"].append({"method": method_name, "available": True, "error": str(exc)})
+        result["failure_reason"] = "SolidWorks did not create the manufacturing technical-requirements note."
+        self._warnings.append("drawing_manufacturing_note:manufacturing_note_failed")
+        self.record_event("drawing.manufacturing_note", "failed", result)
         return result
 
     def _merge_existing_model_overall_note_dimension_result(
@@ -7938,6 +8626,20 @@ class SolidWorksCOMAdapter(CADAdapter):
             candidate = _best_center_hole_flange_circle_edge(edge_result["edges"], spec)
             if candidate is None:
                 attempt["failure_reason"] = "No matching center-hole flange circular edge could be selected."
+                return False
+
+            attempt["selected_edge"] = candidate["summary"]
+            selected = self._select_drawing_view_entity(view, candidate["edge"])
+            attempt["selected_count"] = 1 if selected else 0
+            return selected
+
+        if selector == "existing_model_inner_diameter":
+            edge_result = self._visible_dimension_edges_for_view(view)
+            attempt["visible_edge_count"] = edge_result["visible_edge_count"]
+            attempt["edge_samples"] = edge_result["edge_samples"]
+            candidate = _best_existing_model_inner_circle_edge(edge_result["edges"], spec)
+            if candidate is None:
+                attempt["failure_reason"] = "No matching imported-model inner circular edge could be selected."
                 return False
 
             attempt["selected_edge"] = candidate["summary"]
@@ -9679,6 +10381,54 @@ def _best_center_hole_flange_circle_edge(edges: list[Any], spec: dict[str, Any])
     return None
 
 
+def _best_existing_model_inner_circle_edge(edges: list[Any], spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Select the largest non-outer concentric circular edge for imported-model ID."""
+
+    selector_data = spec.get("edge_selector_data", {})
+    try:
+        outer_radius = float(selector_data.get("outer_radius_m") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        outer_radius = 0.0
+    candidates: list[dict[str, Any]] = []
+    for edge in edges:
+        raw_params = _edge_curve_params(edge)
+        arc = _arc_summary_from_curve_params(raw_params)
+        if arc is None or arc.get("is_arc"):
+            continue
+        radius = float(arc.get("radius") or 0.0)
+        fallback_radius = None
+        values = _numeric_sequence(raw_params)
+        if radius <= 0 and values:
+            fallback_radius = abs(float(values[0]))
+            radius = fallback_radius
+        if radius <= 0:
+            continue
+        if outer_radius > 0 and radius >= outer_radius * 0.92:
+            continue
+        center_distance = _point_distance(arc["center"], (0.0, 0.0, 0.0))
+        candidates.append(
+            {
+                "edge": edge,
+                "radius": radius,
+                "center_distance": center_distance,
+                "summary": {
+                    "role": str(selector_data.get("role", "existing_model_inner_diameter")),
+                    "center": list(arc["center"]),
+                    "radius": radius,
+                    "fallback_radius": fallback_radius,
+                    "outer_radius": outer_radius,
+                    "center_distance": center_distance,
+                },
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (float(item["radius"]), -float(item["center_distance"])), reverse=True)
+    best = candidates[0]
+    best["summary"]["candidate_count"] = len(candidates)
+    return {"edge": best["edge"], "summary": best["summary"]}
+
+
 def _best_line_edge_for_length(edges: list[Any], spec: dict[str, Any]) -> dict[str, Any] | None:
     """Select the visible straight edge that best matches a requested line length."""
 
@@ -10051,6 +10801,79 @@ def _existing_model_note_text(
             "Dimension evidence: display diameter + model bounding-box note",
         ]
     )
+
+
+def _existing_model_manufacturing_note_text(
+    existing_model: dict[str, Any],
+    dimensions_mm: dict[str, Any],
+    dimension_result: dict[str, Any],
+    layout: dict[str, Any],
+    mass_property_result: dict[str, Any],
+) -> str:
+    """Return a visible GB/T-style manufacturing-draft note for imported models."""
+
+    def dimension_value(axis: str) -> str:
+        try:
+            value = float(dimensions_mm.get(axis))
+        except (TypeError, ValueError, AttributeError):
+            return "unknown"
+        return f"{value:.2f} mm"
+
+    source_name = str(existing_model.get("source_name") or Path(str(existing_model.get("path", ""))).name)
+    try:
+        mass_kg = float(mass_property_result.get("mass_kg"))
+        mass_text = f"{mass_kg:.4f} kg"
+    except (TypeError, ValueError):
+        mass_text = "<未知>"
+    return "\n".join(
+        [
+            f"零件来源: {source_name}",
+            "图纸类型: 导入回转件生产加工图草案 / GB/T / 第一角法",
+            "几何尺寸: "
+            f"X {dimension_value('x')} / Y {dimension_value('y')} / Z {dimension_value('z')}",
+            f"重量: {mass_text}    材料: <未指定>    表面处理: <未指定>",
+            "技术要求:",
+            "1. 本图基于导入三维模型自动生成。",
+            "2. 未注明尺寸由导入三维模型几何读取，仅供审图/加工前确认。",
+            "3. 未注公差、材料、表面处理按人工补充文件或订单要求执行。",
+            "4. 关键尺寸/公差需人工确认后方可生产放行。",
+            "5. Imported model draft; dimensions, tolerances, material and surface finish require manual confirmation.",
+            f"6. 尺寸证据: {dimension_result.get('dimension_layout_status', 'unknown')}；"
+            f"版式: {layout.get('status', 'unknown')}。",
+        ]
+    )
+
+
+def _existing_model_rotational_axis_result(layout: dict[str, Any]) -> dict[str, Any]:
+    """Infer a rotational axis from the imported model bounding box."""
+
+    dimensions = layout.get("model_dimensions_m") if isinstance(layout, dict) else {}
+    if not isinstance(dimensions, dict):
+        return {"status": "axis_unresolved", "confidence": 0.0, "failure_reason": "missing_dimensions"}
+    values: dict[str, float] = {}
+    for axis in ("x", "y", "z"):
+        try:
+            value = float(dimensions.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            values[axis] = value
+    if len(values) < 3:
+        return {"status": "axis_unresolved", "confidence": 0.0, "failure_reason": "incomplete_dimensions"}
+    sorted_axes = sorted(values.items(), key=lambda item: item[1])
+    axis, axial_length = sorted_axes[0]
+    radial_1 = sorted_axes[1][1]
+    radial_2 = sorted_axes[2][1]
+    radial_similarity = 1.0 - abs(radial_2 - radial_1) / max(radial_2, 0.001)
+    squat_ratio = 1.0 - min(axial_length / max(radial_2, 0.001), 1.0)
+    confidence = max(0.0, min(0.98, radial_similarity * 0.70 + squat_ratio * 0.30))
+    return {
+        "status": "axis_verified" if confidence >= 0.70 else "axis_unresolved",
+        "axis": axis,
+        "confidence": round(confidence, 3),
+        "radial_axes": [sorted_axes[1][0], sorted_axes[2][0]],
+        "dimensions_m": values,
+    }
 
 
 def _material_database_candidates(configured_database: Any) -> list[str]:
@@ -11462,7 +12285,7 @@ def _trusted_basic_dimension_ids_from_plan(plan: ModelPlan) -> list[str]:
 def _existing_model_overall_dimension_ids() -> list[str]:
     """Return stable ids for imported-model overall drawing dimensions."""
 
-    return ["overall_outer_diameter", "overall_size_note"]
+    return ["overall_outer_diameter", "inner_diameter", "overall_length"]
 
 
 def _existing_model_overall_dimension_specs(
@@ -11484,17 +12307,20 @@ def _existing_model_overall_dimension_specs(
                 model_values.append(numeric)
     max_model_dim = max(model_values) if model_values else None
     min_model_dim = min(model_values) if model_values else None
+    end_outline = _view_outline_for_role("end", views, view_result)
+    section_outline = _view_outline_for_role("section", views, view_result)
     top_outline = _view_outline_for_role("top", views, view_result)
     front_outline = _view_outline_for_role("front", views, view_result)
     specs: list[dict[str, Any]] = []
     edge_types = ("EDGE", "SKETCHSEGMENT", "EXTSKETCHSEGMENT", "LINE", "ARC")
-    diameter_outline = top_outline or front_outline
-    diameter_role = "top" if top_outline is not None else "front"
+    diameter_outline = end_outline or top_outline or front_outline
+    diameter_role = "end" if end_outline is not None else "top" if top_outline is not None else "front"
     if diameter_outline is not None:
         left, bottom, right, top = diameter_outline
         mid_x = (left + right) / 2.0
         mid_y = (bottom + top) / 2.0
         width = right - left
+        outer_radius = (max_model_dim or (top - bottom)) / 2.0
         specs.append(
             {
                 "id": "overall_outer_diameter",
@@ -11503,7 +12329,7 @@ def _existing_model_overall_dimension_specs(
                 "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2", "AddDimension2"],
                 "edge_selector": "center_hole_flange_diameter",
                 "edge_selector_data": {
-                    "expected_radius_m": (max_model_dim or (top - bottom)) / 2.0,
+                    "expected_radius_m": outer_radius,
                     "role": "existing_model_outer_diameter",
                     "allow_unknown_radius": True,
                 },
@@ -11513,6 +12339,50 @@ def _existing_model_overall_dimension_specs(
                 ],
                 "point_sets": _vertical_outline_point_sets(diameter_outline, edge_types),
                 "position": {"x": right + max(width * 0.16, 0.012), "y": mid_y},
+            }
+        )
+        specs.append(
+            {
+                "id": "inner_diameter",
+                "view_role": diameter_role,
+                "method": "AddDiameterDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_inner_diameter",
+                "edge_selector_data": {
+                    "outer_radius_m": outer_radius,
+                    "role": "existing_model_inner_diameter",
+                },
+                "points": [
+                    {"x": mid_x, "y": mid_y, "selection_types": edge_types},
+                ],
+                "position": {"x": right + max(width * 0.16, 0.012), "y": mid_y - max(width * 0.20, 0.014)},
+                "minimum_selections": 1,
+            }
+        )
+    length_outline = section_outline or front_outline
+    length_role = "section" if section_outline is not None else "front"
+    if length_outline is not None:
+        left, bottom, right, top = length_outline
+        mid_x = (left + right) / 2.0
+        mid_y = (bottom + top) / 2.0
+        height = top - bottom
+        specs.append(
+            {
+                "id": "overall_length",
+                "view_role": length_role,
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "y",
+                    "expected_length_m": min_model_dim or height,
+                    "role": "existing_model_overall_length",
+                },
+                "points": [
+                    {"x": mid_x, "y": bottom, "selection_types": edge_types},
+                    {"x": mid_x, "y": top, "selection_types": edge_types},
+                ],
+                "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
             }
         )
     return specs
