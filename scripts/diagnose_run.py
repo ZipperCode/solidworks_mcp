@@ -1,9 +1,4 @@
-"""Summarize a SolidWorks MCP debug run directory.
-
-This script performs offline log analysis only.  It does not connect to
-SolidWorks, execute a plan or mutate CAD files, so it is safe to run on macOS
-after copying a Windows run directory back for diagnosis.
-"""
+"""Summarize a SolidWorks MCP debug run directory."""
 
 from __future__ import annotations
 
@@ -11,7 +6,14 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from solidworks_mcp.run_diagnostics import diagnose_run_directory
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,86 +27,26 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="Number of final events to include in the summary.",
     )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print only the production verdict and compact acceptance summary.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
-    """Read debug artifacts and print a compact diagnosis summary."""
+    """Read debug artifacts and print a diagnosis summary."""
 
     args = parse_args()
-    run_dir = Path(args.run_dir).expanduser().resolve()
-    report = _read_json(run_dir / "execution_report.json")
-    artifacts = _read_json(run_dir / "artifacts.json")
-    environment = _read_json(run_dir / "environment.json")
-    events = _read_jsonl(run_dir / "events.jsonl")
-
-    missing_files = _missing_artifacts(artifacts)
-    failed_events = [event for event in events if event.get("status") == "failed"]
-    step_results = report.get("step_results", []) if report else []
-    failed_steps = [step for step in step_results if not step.get("ok", True)]
-    diagnostics = report.get("diagnostics", {}) if report else {}
-
-    summary = {
-        "run_dir": str(run_dir),
-        "ok": report.get("ok") if report else False,
-        "plan_name": report.get("plan_name") if report else None,
-        "failure_class": report.get("failure_class") if report else "missing_report",
-        "message": report.get("message") if report else "execution_report.json is missing or invalid",
-        "adapter": report.get("adapter") if report else environment.get("adapter"),
-        "debug_level": environment.get("debug_level"),
-        "failed_steps": failed_steps,
-        "diagnostics": diagnostics,
-        "missing_artifacts": missing_files,
-        "failed_events": failed_events,
-        "last_events": events[-args.tail:],
-        "repro_command": report.get("repro_command") if report else None,
-    }
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return 0 if report and not missing_files else 1
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning an empty object when it is unavailable."""
-
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Read JSONL events while skipping malformed lines."""
-
-    events: list[dict[str, Any]] = []
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                events.append({"event": "diagnose.invalid_jsonl", "status": "failed", "raw": line[:200]})
-    except Exception:
-        return []
-    return events
-
-
-def _missing_artifacts(artifacts: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return artifact entries whose indexed files or directories are missing."""
-
-    missing: list[dict[str, Any]] = []
-    for group_name in ("fixed_files", "output_files", "preview_files", "directories"):
-        group = artifacts.get(group_name, {}) if artifacts else {}
-        for name, item in group.items():
-            if not item.get("exists", False):
-                missing.append({
-                    "group": group_name,
-                    "name": name,
-                    "path": item.get("path"),
-                })
-    return missing
+    payload = diagnose_run_directory(
+        args.run_dir,
+        tail=args.tail,
+        summary_only=args.summary_only,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if payload.get("ok") else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

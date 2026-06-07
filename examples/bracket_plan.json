@@ -1,0 +1,48 @@
+{
+  "name": "bracket",
+  "description": "Controlled L-bracket production baseline with one base hole and one upright hole.",
+  "units": "mm",
+  "metadata": {
+    "part_number": "BKT-080-050-070-006",
+    "revision": "A",
+    "author": "solidworks_mcp"
+  },
+  "output_formats": ["sldprt", "step", "stl"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "operations": [
+    {
+      "id": "bracket",
+      "op": "create_bracket",
+      "description": "Create an 80 x 50 x 70 mm controlled L bracket with 12 mm legs and 6 mm through holes.",
+      "parameters": {
+        "base_length": 80,
+        "base_width": 50,
+        "base_thickness": 12,
+        "upright_height": 70,
+        "upright_thickness": 12,
+        "hole_diameter": 6
+      }
+    },
+    {
+      "id": "material",
+      "op": "assign_material",
+      "description": "Assign production baseline material.",
+      "parameters": {
+        "material": "Plain Carbon Steel"
+      }
+    },
+    {
+      "id": "drawing",
+      "op": "make_drawing",
+      "description": "Create drawing views and trusted bracket dimensions.",
+      "parameters": {}
+    }
+  ]
+}

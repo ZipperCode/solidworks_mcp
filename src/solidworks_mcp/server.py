@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -10,6 +11,9 @@ from solidworks_mcp.adapters import create_adapter
 from solidworks_mcp.capabilities import capability_catalog_json, capability_category_json
 from solidworks_mcp.config import SolidWorksMCPConfig
 from solidworks_mcp.executor import ModelPlanExecutor
+from solidworks_mcp.release_diagnostics import diagnose_release_gate_report
+from solidworks_mcp.run_diagnostics import diagnose_run_collection, diagnose_run_directory
+from solidworks_mcp.sessions import AtomicSessionManager
 
 
 def build_executor() -> ModelPlanExecutor:
@@ -20,6 +24,7 @@ def build_executor() -> ModelPlanExecutor:
 
 
 executor = build_executor()
+atomic_sessions = AtomicSessionManager(executor)
 mcp = FastMCP("solidworks-mcp")
 
 
@@ -42,11 +47,26 @@ def validate_model_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
     This is the schema gate for AI-generated ``ModelPlan`` payloads.  It checks
     units, export formats, required fields, and the current executable operation
-    whitelist.  Planned capabilities from the capability catalog must be kept
-    out of this plan until they are promoted into ``SUPPORTED_OPERATIONS``.
+    whitelist.  Schema-valid freeform operations are development capabilities,
+    not trusted production workflows.  Keep planned capabilities from the
+    capability catalog out of this plan until they are promoted into
+    ``SUPPORTED_OPERATIONS``.
     """
 
     return executor.validate_plan(plan).to_dict()
+
+
+@mcp.tool()
+def preflight_environment(plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Check SolidWorks MCP runtime prerequisites before confirmed execution.
+
+    This performs the same hard-gate checks that ``execute_model_plan`` runs
+    internally: SolidWorks COM availability, template paths or discoverable
+    defaults, pywin32 on Windows, and output-directory writability.  It does not
+    create a part or drawing document.
+    """
+
+    return executor.preflight_environment(plan).to_dict()
 
 
 @mcp.tool()
@@ -56,11 +76,69 @@ def execute_model_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[st
     Call this only after the user has reviewed a validated plan and the client
     passes ``confirmed=true``.  Every confirmed run writes a dedicated run
     directory containing ``plan.normalized.json``, ``execution_report.json``,
-    ``events.jsonl``, ``environment.json``, and ``artifacts.json`` for later
-    failure diagnosis.
+    ``delivery_manifest.json``, ``events.jsonl``, ``environment.json``, and
+    ``artifacts.json`` for later failure diagnosis.
     """
 
     return executor.execute_plan(plan, confirmed=confirmed).to_dict()
+
+
+@mcp.tool()
+def start_model_session(
+    name: str,
+    units: str = "mm",
+    metadata: dict[str, Any] | None = None,
+    output_formats: list[str] | None = None,
+    drawing_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start a staged atomic modeling session without creating CAD documents.
+
+    The session returns a named feature graph containing built-in reference ids
+    such as ``front``, ``top``, ``right``, ``x_axis``, ``y_axis`` and ``z_axis``.
+    Later ``apply_model_operation`` calls may create or reference graph ids, but
+    no SolidWorks document is created until ``finalize_model_session`` is called
+    with ``confirmed=true``.
+    """
+
+    return atomic_sessions.start_model_session(
+        name=name,
+        units=units,
+        metadata=metadata,
+        output_formats=output_formats,
+        drawing_profile=drawing_profile,
+    )
+
+
+@mcp.tool()
+def apply_model_operation(session_id: str, operation: dict[str, Any]) -> dict[str, Any]:
+    """Validate and stage one production atomic operation in a model session.
+
+    This is the safe planning surface for sketch/extrude/cut/hole/fillet/
+    chamfer/pattern/revolve/sweep/loft workflows.  It validates required fields
+    and named feature-graph references before the operation can be finalized.
+    """
+
+    return atomic_sessions.apply_model_operation(session_id, operation)
+
+
+@mcp.tool()
+def finalize_model_session(session_id: str, confirmed: bool = False) -> dict[str, Any]:
+    """Execute a staged atomic session through the normal confirmed run path.
+
+    ``confirmed=false`` preserves the same safety contract as
+    ``execute_model_plan`` and returns a missing-confirmation report.  Confirmed
+    execution writes the standard run directory, manifest, event log, artifacts
+    index and production verdict.
+    """
+
+    return atomic_sessions.finalize_model_session(session_id, confirmed=confirmed)
+
+
+@mcp.tool()
+def abort_model_session(session_id: str) -> dict[str, Any]:
+    """Discard a staged atomic modeling session without touching CAD state."""
+
+    return atomic_sessions.abort_model_session(session_id)
 
 
 @mcp.tool()
@@ -100,6 +178,69 @@ def inspect_active_model() -> dict[str, Any]:
     return executor.inspect_active_model().to_dict()
 
 
+@mcp.tool()
+def diagnose_run(run_dir: str, summary_only: bool = True, tail: int = 12) -> dict[str, Any]:
+    """Diagnose a completed run directory without touching SolidWorks.
+
+    Use this after ``execute_model_plan`` returns a ``run_dir`` or when a copied
+    run directory needs review.  The tool reads ``execution_report.json``,
+    ``artifacts.json``, ``delivery_manifest.json``, ``environment.json`` and
+    ``events.jsonl`` from disk, rechecks artifact paths, and returns the same
+    trusted production verdict as the CLI ``scripts/diagnose_run.py`` helper.  It does not connect to
+    SolidWorks, create documents, export files, or mutate the run directory.
+    """
+
+    return diagnose_run_directory(run_dir, tail=tail, summary_only=summary_only)
+
+
+@mcp.tool()
+def diagnose_runs(
+    root_dir: str,
+    summary_only: bool = True,
+    tail: int = 12,
+    max_runs: int = 0,
+) -> dict[str, Any]:
+    """Audit completed run directories below a root without touching SolidWorks.
+
+    This is the batch companion to ``diagnose_run``.  It recursively finds run
+    directories containing ``execution_report.json``, applies the same trusted
+    single-run diagnosis, and returns aggregate accepted/rejected counts plus
+    issue keys for repair routing.  ``max_runs=0`` is the production default and
+    means a complete unbounded scan; set a positive value only for an explicit
+    exploratory sample.
+    """
+
+    return diagnose_run_collection(root_dir, tail=tail, summary_only=summary_only, max_runs=max_runs)
+
+
+@mcp.tool()
+def diagnose_release_gate(report_file: str, summary_only: bool = True) -> dict[str, Any]:
+    """Verify an archived release_gate_report.json without touching SolidWorks.
+
+    Use this for release handoff review after ``scripts/release_production_gate.py``
+    creates a batch report.  The tool re-runs the offline batch diagnosis for
+    the report's output root and checks that the archived scenario/count verdict
+    still matches the current files on disk.
+    """
+
+    return diagnose_release_gate_report(report_file, summary_only=summary_only)
+
+
+@mcp.tool()
+def cleanup_run_documents(run_dir: str) -> dict[str, Any]:
+    """Close open SolidWorks documents that belong to a completed run directory.
+
+    This is a post-run cleanup remediation tool for real SolidWorks sessions.
+    It reads completed-run artifacts, resolves candidate ``SLDPRT`` and
+    ``SLDDRW`` documents through ``GetOpenDocumentByName``, and calls
+    ``CloseDoc`` only after the open document path is verified inside
+    ``run_dir``.  It does not create documents, export files, or close
+    unrelated user files.
+    """
+
+    return executor.cleanup_run_documents(run_dir)
+
+
 @mcp.resource(
     "solidworks://capabilities",
     title="SolidWorks MCP Capability Catalog",
@@ -124,6 +265,18 @@ def solidworks_capability_category(category: str) -> str:
     return capability_category_json(category)
 
 
+@mcp.resource(
+    "solidworks://preflight/environment",
+    title="SolidWorks MCP Environment Preflight",
+    description="Dynamic current-environment preflight result without starting a modeling transaction.",
+    mime_type="application/json",
+)
+def solidworks_preflight_environment() -> str:
+    """Return current runtime preflight diagnostics without creating documents."""
+
+    return json.dumps(executor.preflight_environment().to_dict(), ensure_ascii=False, indent=2)
+
+
 @mcp.prompt(
     name="plan_solidworks_operation",
     title="Plan SolidWorks Operation",
@@ -145,11 +298,12 @@ User request:
 
 Workflow:
 1. Read solidworks://capabilities or solidworks://capabilities/{{category}} to separate available, planned, research, and blocked abilities.
-2. Draft a ModelPlan only with operations currently accepted by validate_model_plan.
-3. Treat planned, research, and blocked capabilities as design-discussion notes only; never submit them to execute_model_plan.
-4. Prefer high-level operations such as create_mounting_plate when they match the request.
-5. Explain any fallback risks, drawing annotation limits, and export expectations before asking the user to confirm execution.
-6. After confirmed execution, review execution_report.json, events.jsonl, artifacts.json, previews, and diagnostics before declaring success.
+2. For production output, draft a controlled create_mounting_plate, create_center_hole_flange, create_center_hole_plate, create_bracket, create_end_cap, create_mounting_block, create_shaft, create_washer, create_sleeve, or create_slotted_array_plate workflow only when the request matches one of the current trusted workflows; schema-valid freeform operations are non-production experiments unless the user explicitly disables trusted workflow enforcement.
+3. Draft a ModelPlan only with operations currently accepted by validate_model_plan, then run preflight_environment with that candidate plan before asking for confirmed execution.
+4. Treat planned, research, blocked, and schema-valid-but-untrusted capabilities as design-discussion notes only; never submit them to execute_model_plan for a trusted production claim.
+5. Prefer high-level operations such as create_mounting_plate, create_center_hole_flange, create_center_hole_plate, create_bracket, create_end_cap, create_mounting_block, create_shaft, create_washer, create_sleeve, or create_slotted_array_plate when they match the request, but only declare production success when diagnose_run returns an accepted verdict; keep SOLIDWORKS_MCP_ENFORCE_TRUSTED_WORKFLOW=1, SOLIDWORKS_MCP_CLOSE_DOCUMENTS_AFTER_RUN=1, and SOLIDWORKS_MCP_REQUIRE_DIRECT_HOLE_CALLOUT=1 for real SolidWorks production runs.
+6. Explain any fallback risks, drawing annotation limits, preflight blockers, and export expectations before asking the user to confirm execution.
+7. After confirmed execution, call diagnose_run with the returned run_dir and require production_acceptance_status=accepted, artifact_integrity_status=verified, event_log_status=verified, delivery_manifest_status=verified, and environment_status=verified before declaring success. For a directory containing multiple completed runs, call diagnose_runs with max_runs=0 and require scan_status=complete and rejected_count=0 before treating the batch as production handoff ready. For archived release gates, call diagnose_release_gate on release_gate_report.json and require status=verified.
 
 Return a concise plan summary first, then the candidate ModelPlan JSON if it is executable today."""
 

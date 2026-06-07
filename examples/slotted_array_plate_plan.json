@@ -1,0 +1,52 @@
+{
+  "name": "slotted_array_plate",
+  "description": "Controlled slotted hole-array plate production baseline.",
+  "units": "mm",
+  "metadata": {
+    "part_number": "SAP-120-080-010-050-014-008",
+    "revision": "A",
+    "author": "solidworks_mcp"
+  },
+  "output_formats": ["sldprt", "step", "stl"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "operations": [
+    {
+      "id": "slotted_array_plate",
+      "op": "create_slotted_array_plate",
+      "description": "Create a 120 x 80 x 10 mm plate with a 50 x 14 mm center slot and a 2 x 2 array of 8 mm holes.",
+      "parameters": {
+        "length": 120,
+        "width": 80,
+        "thickness": 10,
+        "slot_length": 50,
+        "slot_width": 14,
+        "hole_diameter": 8,
+        "hole_rows": 2,
+        "hole_columns": 2,
+        "hole_spacing_x": 90,
+        "hole_spacing_y": 50
+      }
+    },
+    {
+      "id": "material",
+      "op": "assign_material",
+      "description": "Assign production baseline material.",
+      "parameters": {
+        "material": "Plain Carbon Steel"
+      }
+    },
+    {
+      "id": "drawing",
+      "op": "make_drawing",
+      "description": "Create drawing views and trusted slotted-array plate dimensions.",
+      "parameters": {}
+    }
+  ]
+}

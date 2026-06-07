@@ -1,0 +1,43 @@
+{
+  "name": "controlled_weldment_frame",
+  "units": "mm",
+  "output_formats": ["sldprt", "step", "stl", "csv"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "metadata": {
+    "description": "Controlled structural-member weldment frame production fixture"
+  },
+  "operations": [
+    {
+      "id": "weldment_frame",
+      "op": "create_weldment_frame",
+      "description": "Create a rectangular square-tube weldment frame with cut-list evidence.",
+      "parameters": {
+        "length": 300,
+        "width": 220,
+        "profile": {
+          "standard": "ansi inch",
+          "type": "square_tube",
+          "size": "2 x 2 x 0.25",
+          "outer_width": 50.8,
+          "outer_height": 50.8,
+          "wall_thickness": 6.35
+        },
+        "cut_list": {
+          "columns": ["item", "member_id", "description", "quantity", "length_mm", "profile", "material"],
+          "export_formats": ["csv"]
+        }
+      }
+    },
+    {
+      "op": "make_drawing",
+      "parameters": {}
+    }
+  ]
+}

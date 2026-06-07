@@ -1,0 +1,46 @@
+{
+  "name": "mounting_block",
+  "description": "Controlled mounting block production baseline with a concentric through hole.",
+  "units": "mm",
+  "metadata": {
+    "part_number": "MBK-080-050-030-018",
+    "revision": "A",
+    "author": "solidworks_mcp"
+  },
+  "output_formats": ["sldprt", "step", "stl"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "operations": [
+    {
+      "id": "mounting_block",
+      "op": "create_mounting_block",
+      "description": "Create an 80 x 50 x 30 mm mounting block with an 18 mm center through hole.",
+      "parameters": {
+        "length": 80,
+        "width": 50,
+        "height": 30,
+        "hole_diameter": 18
+      }
+    },
+    {
+      "id": "material",
+      "op": "assign_material",
+      "description": "Assign production baseline material.",
+      "parameters": {
+        "material": "Plain Carbon Steel"
+      }
+    },
+    {
+      "id": "drawing",
+      "op": "make_drawing",
+      "description": "Create drawing views and trusted mounting-block dimensions.",
+      "parameters": {}
+    }
+  ]
+}

@@ -1,8 +1,11 @@
 {
-  "name": "center_hole_flange",
+  "name": "end_cap",
+  "description": "Controlled circular end cap production baseline.",
   "units": "mm",
   "metadata": {
-    "description": "Controlled cylindrical flange candidate: OD100 x 12 mm with a 24 mm center through hole."
+    "part_number": "ECP-100-06",
+    "revision": "A",
+    "author": "solidworks_mcp"
   },
   "output_formats": ["sldprt", "step", "stl"],
   "drawing_profile": {
@@ -15,19 +18,22 @@
   },
   "operations": [
     {
-      "id": "center_hole_flange",
-      "op": "create_center_hole_flange",
-      "description": "Create the controlled center-hole flange candidate.",
+      "id": "end_cap",
+      "op": "create_end_cap",
+      "description": "Create a circular end cap with a center bore and six bolt holes.",
       "parameters": {
         "outer_diameter": 100,
-        "thickness": 12,
-        "hole_diameter": 24
+        "thickness": 10,
+        "center_hole_diameter": 20,
+        "bolt_circle_diameter": 70,
+        "bolt_hole_diameter": 8,
+        "bolt_hole_count": 6
       }
     },
     {
       "id": "material",
       "op": "assign_material",
-      "description": "Assign a common steel material.",
+      "description": "Assign production baseline material.",
       "parameters": {
         "material": "Plain Carbon Steel"
       }
@@ -35,7 +41,7 @@
     {
       "id": "drawing",
       "op": "make_drawing",
-      "description": "Request trusted flange drawing outputs with real dimensions and hole callout.",
+      "description": "Create drawing views and trusted end-cap dimensions.",
       "parameters": {}
     }
   ]

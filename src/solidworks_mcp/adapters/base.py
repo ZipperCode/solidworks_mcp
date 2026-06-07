@@ -59,6 +59,10 @@ class CADAdapter(ABC):
         """Connect to the CAD application and return environment information."""
 
     @abstractmethod
+    def preflight_environment(self, plan: ModelPlan | None = None) -> dict[str, Any]:
+        """Check runtime prerequisites before starting a modeling transaction."""
+
+    @abstractmethod
     def begin_transaction(self, plan: ModelPlan) -> dict[str, Any]:
         """Create or clone a document so execution does not mutate user files."""
 
@@ -79,5 +83,17 @@ class CADAdapter(ABC):
         """Return a compact model summary for AI self-review."""
 
     @abstractmethod
+    def document_state_snapshot(self, phase: str) -> dict[str, Any]:
+        """Return a best-effort snapshot of open CAD documents for cleanup auditing."""
+
+    @abstractmethod
     def capture_previews(self, plan: ModelPlan) -> dict[str, str]:
         """Capture multiple preview images or mock placeholders."""
+
+    @abstractmethod
+    def cleanup_after_run(self, plan: ModelPlan | None = None) -> dict[str, Any]:
+        """Release documents created by the current execution run."""
+
+    @abstractmethod
+    def cleanup_run_documents(self, run_dir: str | Path) -> dict[str, Any]:
+        """Best-effort close open documents that belong to a completed run directory."""

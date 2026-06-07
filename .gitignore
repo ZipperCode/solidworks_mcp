@@ -1,5 +1,6 @@
 .serena/
 outputs/
+test_outputs*/
 .venv/
 __pycache__/
 *.py[cod]

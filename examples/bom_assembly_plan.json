@@ -1,0 +1,61 @@
+{
+  "name": "controlled_bom_assembly",
+  "units": "mm",
+  "output_formats": ["sldasm", "step", "csv"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": false,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "metadata": {
+    "description": "Controlled assembly and BOM production fixture"
+  },
+  "operations": [
+    {
+      "id": "assembly",
+      "op": "create_bom_assembly",
+      "description": "Create a small generated assembly with a verified BOM.",
+      "parameters": {
+        "components": [
+          {
+            "id": "plate_a",
+            "kind": "plate",
+            "part_number": "ASM-PLATE-A",
+            "description": "Base plate",
+            "quantity": 1,
+            "material": "Plain Carbon Steel",
+            "dimensions": {
+              "length": 100,
+              "width": 60,
+              "thickness": 8
+            }
+          },
+          {
+            "id": "spacer_a",
+            "kind": "spacer",
+            "part_number": "ASM-SPACER-A",
+            "description": "Center spacer",
+            "quantity": 2,
+            "material": "Plain Carbon Steel",
+            "dimensions": {
+              "outer_diameter": 18,
+              "inner_diameter": 8,
+              "length": 20
+            }
+          }
+        ],
+        "bom": {
+          "columns": ["item", "component_id", "part_number", "description", "quantity", "material"],
+          "export_formats": ["csv"]
+        }
+      }
+    },
+    {
+      "op": "make_drawing",
+      "parameters": {}
+    }
+  ]
+}

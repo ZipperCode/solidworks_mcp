@@ -1,8 +1,8 @@
 {
-  "name": "center_hole_flange",
+  "name": "center_hole_plate",
   "units": "mm",
   "metadata": {
-    "description": "Controlled cylindrical flange candidate: OD100 x 12 mm with a 24 mm center through hole."
+    "description": "Controlled rectangular center-hole plate: 100 x 60 x 12 mm with a 24 mm center through hole."
   },
   "output_formats": ["sldprt", "step", "stl"],
   "drawing_profile": {
@@ -15,11 +15,12 @@
   },
   "operations": [
     {
-      "id": "center_hole_flange",
-      "op": "create_center_hole_flange",
-      "description": "Create the controlled center-hole flange candidate.",
+      "id": "center_hole_plate",
+      "op": "create_center_hole_plate",
+      "description": "Create the controlled rectangular center-hole plate.",
       "parameters": {
-        "outer_diameter": 100,
+        "length": 100,
+        "width": 60,
         "thickness": 12,
         "hole_diameter": 24
       }
@@ -35,7 +36,7 @@
     {
       "id": "drawing",
       "op": "make_drawing",
-      "description": "Request trusted flange drawing outputs with real dimensions and hole callout.",
+      "description": "Request drawing outputs with trusted dimensions and hole callout.",
       "parameters": {}
     }
   ]

@@ -1,0 +1,40 @@
+{
+  "name": "controlled_sheet_metal_base_flange",
+  "units": "mm",
+  "output_formats": ["sldprt", "step", "stl", "dxf"],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "metadata": {
+    "description": "Controlled sheet-metal base flange production fixture"
+  },
+  "operations": [
+    {
+      "id": "sheet_metal_base",
+      "op": "create_sheet_metal_base_flange",
+      "description": "Create a controlled sheet-metal base flange with flat-pattern DXF evidence.",
+      "parameters": {
+        "length": 120,
+        "width": 80,
+        "thickness": 2,
+        "bend_radius": 2,
+        "k_factor": 0.5
+      }
+    },
+    {
+      "op": "assign_material",
+      "parameters": {
+        "material": "Plain Carbon Steel"
+      }
+    },
+    {
+      "op": "make_drawing",
+      "parameters": {}
+    }
+  ]
+}

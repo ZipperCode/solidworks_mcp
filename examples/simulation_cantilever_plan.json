@@ -1,0 +1,55 @@
+{
+  "name": "controlled_static_simulation",
+  "units": "mm",
+  "metadata": {
+    "description": "Controlled cantilever static simulation production fixture"
+  },
+  "operations": [
+    {
+      "id": "static_simulation",
+      "op": "run_static_simulation",
+      "description": "Create a cantilever beam, apply a fixed left face and right-face force, and verify static-study results.",
+      "parameters": {
+        "study_type": "cantilever_static",
+        "geometry": {
+          "length": 120,
+          "width": 20,
+          "height": 8,
+          "material": "Plain Carbon Steel"
+        },
+        "fixture": {
+          "type": "fixed_face",
+          "face": "left"
+        },
+        "load": {
+          "type": "force",
+          "face": "right",
+          "direction": "-Y",
+          "magnitude": 250
+        },
+        "mesh": {
+          "element_size": 4,
+          "tolerance": 0.2
+        },
+        "acceptance": {
+          "max_von_mises_mpa": 200,
+          "min_factor_of_safety": 1.5,
+          "max_displacement_mm": 2
+        },
+        "report": {
+          "columns": ["metric", "value", "unit", "status", "limit"],
+          "export_formats": ["csv"]
+        }
+      }
+    }
+  ],
+  "drawing_profile": {
+    "enabled": true,
+    "sheet_format": "A3",
+    "projection": "third_angle",
+    "include_isometric": true,
+    "include_basic_dimensions": true,
+    "export_formats": ["pdf", "dwg"]
+  },
+  "output_formats": ["sldprt", "step", "stl", "csv"]
+}
