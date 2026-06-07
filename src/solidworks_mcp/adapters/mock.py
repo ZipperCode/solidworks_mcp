@@ -20,6 +20,7 @@ from solidworks_mcp.schemas import (
     DrawingProfile,
     end_cap_basic_dimension_ids_from_plan,
     end_cap_parameters_from_plan,
+    existing_model_parameters_from_plan,
     ModelOperation,
     ModelPlan,
     StepResult,
@@ -73,6 +74,7 @@ class MockCADAdapter(CADAdapter):
         self._model_geometry_result: dict[str, Any] = {"status": "not_requested"}
         self._mass_property_status = "not_requested"
         self._mass_property_result: dict[str, Any] = {"status": "not_requested"}
+        self._existing_model_result: dict[str, Any] = {"status": "not_requested"}
         self._export_result: dict[str, Any] = {"status": "not_requested", "formats": [], "exported": [], "failed": []}
         self._assembly_result: dict[str, Any] = {"status": "not_requested"}
         self._bom_result: dict[str, Any] = {"status": "not_requested"}
@@ -157,6 +159,7 @@ class MockCADAdapter(CADAdapter):
         self._model_geometry_result = {"status": "not_requested"}
         self._mass_property_status = "not_requested"
         self._mass_property_result = {"status": "not_requested"}
+        self._existing_model_result = {"status": "not_requested"}
         self._export_result = {"status": "not_requested", "formats": [], "exported": [], "failed": []}
         self._assembly_result = {"status": "not_requested"}
         self._bom_result = {"status": "not_requested"}
@@ -208,6 +211,8 @@ class MockCADAdapter(CADAdapter):
             return self._execute_sleeve(operation, index, plan)
         if operation.op == "create_slotted_array_plate":
             return self._execute_slotted_array_plate(operation, index, plan)
+        if operation.op == "import_existing_model":
+            return self._execute_import_existing_model(operation, index, plan)
         if operation.op == "assign_material":
             return self._execute_assign_material(operation, index)
         if operation.op == "set_custom_properties":
@@ -351,6 +356,74 @@ class MockCADAdapter(CADAdapter):
             op=operation.op,
             ok=True,
             message="Mock executed create_bom_assembly with BOM evidence.",
+            details=feature,
+        )
+
+    def _execute_import_existing_model(self, operation: ModelOperation, index: int, plan: ModelPlan) -> StepResult:
+        """Record an imported existing model with run-dir isolation evidence."""
+
+        params = existing_model_parameters_from_plan(plan)
+        if params is None:
+            raise RuntimeError("import_existing_model parameters could not be extracted")
+        workspace = self._require_workspace()
+        source_path = Path(str(params["path"])).expanduser().resolve()
+        run_model_path = workspace / "imported" / source_path.name
+        run_model_path.parent.mkdir(parents=True, exist_ok=True)
+        run_model_path.write_text(
+            f"Mock imported existing {params['document_type']} from {source_path}\n",
+            encoding="utf-8",
+        )
+        measured_dimensions_mm = {"x": 86.0, "y": 42.0, "z": 42.0}
+        self._existing_model_result = {
+            "status": "existing_model_imported",
+            "method": "mock_import_existing_model",
+            "source_path": path_to_string(source_path),
+            "run_model_path": path_to_string(run_model_path),
+            "copied_to_run_dir": bool(params.get("copy_to_run_dir", True)),
+            "document_type": params["document_type"],
+            "source_name": params["source_name"],
+        }
+        self._model_geometry_status = "geometry_verified"
+        self._model_geometry_result = {
+            "status": "geometry_verified",
+            "workflow": "existing_model",
+            "body_count": 1,
+            "bbox_m": [0.0, 0.0, 0.0, 0.086, 0.042, 0.042],
+            "measured_dimensions_mm": measured_dimensions_mm,
+            "checks": {
+                "source_file_exists": source_path.exists(),
+                "copied_to_run_dir": True,
+                "bbox_dimensions_positive": True,
+                "body_count_positive": True,
+            },
+        }
+        self._mass_property_status = "mass_properties_verified"
+        self._mass_property_result = {
+            "status": "mass_properties_verified",
+            "method": "mock_existing_model_mass_properties",
+            "mass_kg": 0.18,
+            "volume_m3": 2.3e-5,
+            "checks": {"positive_mass": True, "positive_volume": True},
+        }
+        feature = {
+            "index": index,
+            "id": operation.id or "import_existing_model",
+            "op": operation.op,
+            "description": operation.description,
+            "parameters": operation.parameters,
+            "existing_model_result": self._existing_model_result,
+            "model_geometry_result": self._model_geometry_result,
+            "mass_property_result": self._mass_property_result,
+        }
+        self._features.append(feature)
+        self.record_event("existing_model.import", "completed", self._existing_model_result)
+        self.record_event("adapter.operation", "completed", feature)
+        return StepResult(
+            index=index,
+            id=operation.id,
+            op=operation.op,
+            ok=True,
+            message="Mock imported existing model with run-dir isolation evidence.",
             details=feature,
         )
 
@@ -1123,7 +1196,17 @@ class MockCADAdapter(CADAdapter):
         self._drawing_view_status = "created"
         self._drawing_view_result = _mock_standard_drawing_view_result()
         self.record_event("drawing.standard_views", "completed", self._drawing_view_result)
-        if self._config.force_drawing_callout_failure:
+        if existing_model_parameters_from_plan(plan) is not None:
+            self._drawing_annotation_status = "not_requested"
+            self._drawing_annotation_result = {
+                "status": "not_requested",
+                "created_callout_count": 0,
+                "direct_hole_callout_created": None,
+                "callout_creation_method": None,
+                "reason": "existing_model_drawing_uses_imported_or_overall_annotations",
+            }
+            self.record_event("drawing.hole_callout", "skipped", self._drawing_annotation_result)
+        elif self._config.force_drawing_callout_failure:
             self._drawing_annotation_status = "forced_failure"
             self._drawing_annotation_result = {
                 "status": "forced_failure",
@@ -1154,8 +1237,24 @@ class MockCADAdapter(CADAdapter):
             self._drawing_dimension_status = "not_requested"
             self._drawing_dimension_result = {"status": "not_requested"}
         self._drawing_metadata_note_result = _mock_metadata_note_result(plan)
+        if existing_model_parameters_from_plan(plan) is not None:
+            self._drawing_metadata_note_result = {
+                "status": "existing_model_note_created",
+                "custom_property_note": self._drawing_metadata_note_result,
+                "existing_model_note": {
+                    "status": "existing_model_note_created",
+                    "method": "mock_create_text",
+                    "text": (
+                        "Source: mock existing model\n"
+                        "Overall size: X 86.00 mm / Y 42.00 mm / Z 42.00 mm\n"
+                        "Dimension evidence: display diameter + model bounding-box note"
+                    ),
+                },
+            }
         if self._drawing_metadata_note_result["status"] == "metadata_note_created":
             self.record_event("drawing.metadata_note", "completed", self._drawing_metadata_note_result)
+        if self._drawing_metadata_note_result["status"] == "existing_model_note_created":
+            self.record_event("drawing.existing_model_note", "completed", self._drawing_metadata_note_result)
         drawing_path = workspace / "exports" / f"{safe_output_name(plan.name)}.drawing.json"
         drawing_path.parent.mkdir(parents=True, exist_ok=True)
         slddrw_path = workspace / "exports" / f"{safe_output_name(plan.name)}.slddrw"
@@ -1287,6 +1386,7 @@ class MockCADAdapter(CADAdapter):
             "model_geometry_result": self._model_geometry_result,
             "mass_property_status": self._mass_property_status,
             "mass_property_result": self._mass_property_result,
+            "existing_model_result": self._existing_model_result,
             "export_result": self._export_result,
             "assembly_result": self._assembly_result,
             "bom_result": self._bom_result,
@@ -1413,11 +1513,63 @@ class MockCADAdapter(CADAdapter):
 def _mock_standard_drawing_view_result() -> dict[str, Any]:
     """Return deterministic standard-view diagnostics for mock smoke."""
 
+    layout = {
+        "status": "layout_verified",
+        "auto_layout": True,
+        "sheet_size_m": {"width": 0.420, "height": 0.297},
+        "safe_rect_m": {"left": 0.018, "bottom": 0.060, "right": 0.402, "top": 0.279},
+        "scale": 1.0,
+        "model_dimensions_mm": {"x": 86.0, "y": 42.0, "z": 42.0},
+        "clipped_view_count": 0,
+        "verified_view_count": 4,
+        "clipped_views": [],
+    }
     views = [
-        {"role": "front", "name": "*Front", "x": 0.18, "y": 0.16},
-        {"role": "top", "name": "*Top", "x": 0.18, "y": 0.28},
-        {"role": "right", "name": "*Right", "x": 0.34, "y": 0.16},
-        {"role": "isometric", "name": "*Isometric", "x": 0.34, "y": 0.28},
+        {
+            "role": "front",
+            "name": "*Front",
+            "x": 0.114,
+            "y": 0.115,
+            "scale": 1.0,
+            "outline": [0.071, 0.094, 0.157, 0.136],
+            "outline_source": "mock_layout",
+        },
+        {
+            "role": "top",
+            "name": "*Top",
+            "x": 0.114,
+            "y": 0.224,
+            "scale": 1.0,
+            "outline": [0.071, 0.203, 0.157, 0.245],
+            "outline_source": "mock_layout",
+        },
+        {
+            "role": "right",
+            "name": "*Right",
+            "x": 0.306,
+            "y": 0.115,
+            "scale": 1.0,
+            "outline": [0.285, 0.094, 0.327, 0.136],
+            "outline_source": "mock_layout",
+        },
+        {
+            "role": "isometric",
+            "name": "*Isometric",
+            "x": 0.306,
+            "y": 0.224,
+            "scale": 1.0,
+            "outline": [0.260, 0.181, 0.352, 0.267],
+            "outline_source": "mock_layout",
+        },
+    ]
+    layout["verified_views"] = [
+        {
+            "role": view["role"],
+            "outline": view["outline"],
+            "outline_source": view["outline_source"],
+            "inside_safe_rect": True,
+        }
+        for view in views
     ]
     return {
         "status": "created",
@@ -1425,6 +1577,7 @@ def _mock_standard_drawing_view_result() -> dict[str, Any]:
         "created_count": len(views),
         "required_roles": [view["role"] for view in views],
         "missing_roles": [],
+        "layout": layout,
         "errors": [],
     }
 
@@ -1444,25 +1597,50 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
             "attempts": [],
         }
 
+    existing_model_required = set(required) == {"overall_outer_diameter", "overall_size_note"}
+    dimension_layout_status = (
+        "existing_model_overall_annotations_created" if existing_model_required else "trusted_dimensions_created"
+    )
     return {
         "status": "basic_dimensions_created",
         "required_dimensions": required,
         "created_dimensions": [
             {
                 "id": dimension_id,
-                "method": "AddRadialDimension2" if dimension_id.startswith("corner_radius_") else "mock_display_dimension",
-                "is_display_dimension": True,
+                "method": (
+                    "mock_existing_model_overall_note"
+                    if dimension_id == "overall_size_note"
+                    else "mock_existing_model_outer_diameter"
+                    if dimension_id == "overall_outer_diameter"
+                    else "AddRadialDimension2"
+                    if dimension_id.startswith("corner_radius_")
+                    else "mock_display_dimension"
+                ),
+                "is_display_dimension": dimension_id != "overall_size_note",
+                "annotation_kind": (
+                    "existing_model_overall_size_note" if dimension_id == "overall_size_note" else None
+                ),
             }
             for dimension_id in required
         ],
         "created_dimension_count": len(required),
         "missing_dimensions": [],
-        "dimension_layout_status": "trusted_dimensions_created",
+        "display_dimension_count": 1 if existing_model_required else len(required),
+        "overall_note_created": existing_model_required,
+        "dimension_layout_status": dimension_layout_status,
         "attempts": [
             {
                 "id": dimension_id,
                 "created": True,
-                "method": "AddRadialDimension2" if dimension_id.startswith("corner_radius_") else "mock_display_dimension",
+                "method": (
+                    "mock_existing_model_overall_note"
+                    if dimension_id == "overall_size_note"
+                    else "mock_existing_model_outer_diameter"
+                    if dimension_id == "overall_outer_diameter"
+                    else "AddRadialDimension2"
+                    if dimension_id.startswith("corner_radius_")
+                    else "mock_display_dimension"
+                ),
             }
             for dimension_id in required
         ],
@@ -1472,6 +1650,8 @@ def _mock_basic_dimension_result(forced_failure: bool, required: list[str]) -> d
 def _mock_required_basic_dimension_ids(plan: ModelPlan) -> list[str]:
     """Return the mock required drawing dimensions for the controlled workflow."""
 
+    if existing_model_parameters_from_plan(plan) is not None:
+        return ["overall_outer_diameter", "overall_size_note"]
     atomic_required = atomic_dimension_ids_from_metadata(plan.metadata)
     if atomic_required:
         return atomic_required

@@ -31,6 +31,7 @@ from solidworks_mcp.schemas import (
     center_hole_plate_basic_dimension_ids_from_plan,
     end_cap_basic_dimension_ids_from_plan,
     ExecutionReport,
+    existing_model_parameters_from_plan,
     ModelPlan,
     PlanValidationError,
     StepResult,
@@ -158,6 +159,12 @@ TRUSTED_ATOMIC_OPERATIONS = {
 }
 TRUSTED_BOM_ASSEMBLY_OPERATIONS = {
     "create_bom_assembly",
+    "set_custom_properties",
+    "make_drawing",
+}
+TRUSTED_EXISTING_MODEL_OPERATIONS = {
+    "import_existing_model",
+    "assign_material",
     "set_custom_properties",
     "make_drawing",
 }
@@ -623,6 +630,7 @@ def _diagnostics_from_inspection(inspection: dict[str, Any]) -> dict[str, Any]:
         "model_geometry_result": inspection.get("model_geometry_result"),
         "mass_property_status": inspection.get("mass_property_status"),
         "mass_property_result": inspection.get("mass_property_result"),
+        "existing_model_result": inspection.get("existing_model_result"),
         "export_result": inspection.get("export_result"),
         "assembly_result": inspection.get("assembly_result"),
         "bom_result": inspection.get("bom_result"),
@@ -906,6 +914,15 @@ def _build_production_acceptance_result(
             preview_files,
             trusted_workflow,
         )
+    if trusted_workflow.get("workflow") == "existing_model":
+        return _build_existing_model_production_acceptance_result(
+            plan,
+            execution_ok,
+            diagnostics,
+            output_files,
+            preview_files,
+            trusted_workflow,
+        )
     if trusted_workflow.get("workflow") == "atomic_model":
         return _build_atomic_production_acceptance_result(
             plan,
@@ -1124,6 +1141,196 @@ def _build_production_acceptance_result(
             "cad_content_status": ["cad_artifacts_verified", "mock_placeholder"],
             "pdf_semantic_content_status": ["pdf_semantic_content_verified", "mock_placeholder"],
             "required_output_files": sorted(REQUIRED_OUTPUT_KEYS),
+            "requested_output_files": sorted(requested_output_keys),
+            "required_preview_files": sorted(REQUIRED_PREVIEW_KEYS),
+            "cleanup_status": ["completed", "skipped_no_documents"],
+            "cleanup_verification_status": "verified unless no documents were created",
+        },
+    }
+
+
+def _build_existing_model_production_acceptance_result(
+    plan: ModelPlan,
+    execution_ok: bool,
+    diagnostics: dict[str, Any],
+    output_files: dict[str, str],
+    preview_files: dict[str, str],
+    trusted_workflow: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a production verdict for imported existing model drawing export."""
+
+    drawing_view_result = _as_dict(diagnostics.get("drawing_view_result"))
+    dimension_result = _as_dict(diagnostics.get("drawing_dimension_result"))
+    artifact_result = _as_dict(diagnostics.get("artifact_validation_result"))
+    content_result = _as_dict(diagnostics.get("artifact_content_result"))
+    cad_content_result = _as_dict(content_result.get("cad_content_result"))
+    pdf_semantic_result = _as_dict(content_result.get("pdf_semantic_content_result"))
+    cleanup_result = _as_dict(diagnostics.get("cleanup_result"))
+    custom_property_result = _as_dict(diagnostics.get("custom_property_result"))
+    material_result = _as_dict(diagnostics.get("material_result"))
+    geometry_result = _as_dict(diagnostics.get("model_geometry_result"))
+    mass_property_result = _as_dict(diagnostics.get("mass_property_result"))
+    export_result = _as_dict(diagnostics.get("export_result"))
+    import_result = _as_dict(diagnostics.get("existing_model_result"))
+    metadata_note_result = _as_dict(diagnostics.get("drawing_metadata_note_result"))
+    existing_model_note_result = _as_dict(metadata_note_result.get("existing_model_note"))
+    document_state_audit = _as_dict(diagnostics.get("document_state_audit_result"))
+    required_material = _required_material_from_plan(plan)
+    required_custom_properties = _required_custom_properties_from_plan(plan)
+    output_keys = set(output_files)
+    preview_keys = set(preview_files)
+    requested_output_keys = set(_combined_export_formats(plan))
+    missing_requested_output_keys = sorted(requested_output_keys - output_keys)
+    failed_exports = [item for item in export_result.get("failed", []) if isinstance(item, dict)]
+    drawing_view_roles = _drawing_view_roles(drawing_view_result)
+    missing_drawing_view_roles = sorted(REQUIRED_DRAWING_VIEW_ROLES - drawing_view_roles)
+    native_output = "sldasm" if trusted_workflow.get("document_type") == "assembly" else "sldprt"
+    required_output_keys = {native_output, "slddrw", "pdf", "dwg"}
+    required_dimensions = {"overall_outer_diameter", "overall_size_note"}
+    created_dimensions = {
+        str(item.get("id"))
+        for item in dimension_result.get("created_dimensions", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    missing_dimensions = sorted(required_dimensions - created_dimensions)
+    display_dimension_count = _positive_int(dimension_result.get("display_dimension_count"))
+    existing_model_note_created = (
+        metadata_note_result.get("status") == "existing_model_note_created"
+        and existing_model_note_result.get("status") == "existing_model_note_created"
+        and _existing_model_note_has_overall_size_evidence(existing_model_note_result)
+    )
+    layout_result = _as_dict(drawing_view_result.get("layout"))
+    checks = {
+        "execution_ok": bool(execution_ok),
+        "trusted_controlled_workflow": trusted_workflow["ok"],
+        "preflight_ready": diagnostics.get("preflight_status") == "ready",
+        "existing_model_imported": import_result.get("status") == "existing_model_imported"
+        and import_result.get("copied_to_run_dir") is True,
+        "drawing_standard_views_created": diagnostics.get("drawing_view_status") == "created"
+        and drawing_view_result.get("status") == "created"
+        and not missing_drawing_view_roles,
+        "drawing_views_not_clipped": layout_result.get("status") == "layout_verified"
+        and layout_result.get("clipped_view_count") == 0,
+        "existing_model_overall_note_created": existing_model_note_created,
+        "basic_dimensions_created": diagnostics.get("drawing_dimension_status") == "basic_dimensions_created"
+        and not missing_dimensions
+        and int(dimension_result.get("created_dimension_count") or 0) >= len(required_dimensions)
+        and display_dimension_count >= 1,
+        "trusted_basic_dimensions": dimension_result.get("dimension_layout_status")
+        in {
+            "existing_model_overall_annotations_created",
+            "existing_model_overall_dimensions_created",
+            "imported_model_dimensions_created",
+        }
+        and display_dimension_count >= 1,
+        "material_verified": required_material is None
+        or (
+            diagnostics.get("material_status") == "material_verified"
+            and _material_result_matches(material_result, required_material)
+        ),
+        "custom_properties_verified": not required_custom_properties
+        or (
+            diagnostics.get("custom_property_status") == "custom_properties_verified"
+            and _custom_property_result_matches(custom_property_result, required_custom_properties)
+        ),
+        "model_geometry_verified": diagnostics.get("model_geometry_status") == "geometry_verified"
+        and geometry_result.get("status") == "geometry_verified"
+        and int(geometry_result.get("body_count") or 0) >= 1,
+        "mass_properties_verified": diagnostics.get("mass_property_status") == "mass_properties_verified"
+        and _positive_number(mass_property_result.get("mass_kg"))
+        and _positive_number(mass_property_result.get("volume_m3")),
+        "artifacts_ready": artifact_result.get("ok") is True
+        and artifact_result.get("status") == "artifacts_ready",
+        "artifact_content_ready": content_result.get("ok") is True
+        and content_result.get("status") in {"content_ready", "mock_preview_placeholders", "mock_output_placeholders"},
+        "cad_artifact_content": cad_content_result.get("ok") is True
+        and cad_content_result.get("status") in {"cad_artifacts_verified", "mock_placeholder"},
+        "drawing_pdf_semantic_content": pdf_semantic_result.get("ok") is True
+        and pdf_semantic_result.get("status") in {"pdf_semantic_content_verified", "mock_placeholder"},
+        "required_output_files": required_output_keys.issubset(output_keys),
+        "requested_output_files": not missing_requested_output_keys and not failed_exports,
+        "required_preview_files": REQUIRED_PREVIEW_KEYS.issubset(preview_keys),
+        "cleanup_completed": cleanup_result.get("enabled") is True
+        and cleanup_result.get("status") in {"completed", "skipped_no_documents"},
+        "cleanup_verified": cleanup_result.get("status") == "skipped_no_documents"
+        or cleanup_result.get("cleanup_verification_status") == "verified",
+        "document_state_audit_verified": document_state_audit.get("status")
+        == "verified_no_run_documents_open"
+        and document_state_audit.get("after_cleanup_run_created_open_count") == 0,
+    }
+    failures = [name for name, ok in checks.items() if not ok]
+    summary = {
+        "trusted_workflow_status": trusted_workflow["status"],
+        "trusted_workflow": trusted_workflow,
+        "existing_model_status": import_result.get("status"),
+        "existing_model_source_path": import_result.get("source_path"),
+        "existing_model_run_path": import_result.get("run_model_path"),
+        "existing_model_document_type": import_result.get("document_type"),
+        "drawing_view_status": diagnostics.get("drawing_view_status"),
+        "drawing_view_roles": sorted(drawing_view_roles),
+        "missing_drawing_view_roles": missing_drawing_view_roles,
+        "drawing_layout_status": layout_result.get("status"),
+        "drawing_layout_scale": layout_result.get("scale"),
+        "drawing_layout_clipped_view_count": layout_result.get("clipped_view_count"),
+        "drawing_layout_sheet_size_m": layout_result.get("sheet_size_m"),
+        "drawing_layout_model_bbox_m": layout_result.get("model_bbox_m"),
+        "drawing_annotation_status": diagnostics.get("drawing_annotation_status"),
+        "dimension_count": dimension_result.get("created_dimension_count"),
+        "display_dimension_count": dimension_result.get("display_dimension_count"),
+        "dimension_layout_status": dimension_result.get("dimension_layout_status"),
+        "missing_dimensions": missing_dimensions,
+        "required_dimensions": sorted(required_dimensions),
+        "existing_model_note_status": existing_model_note_result.get("status"),
+        "existing_model_note_method": existing_model_note_result.get("method"),
+        "model_geometry_status": diagnostics.get("model_geometry_status"),
+        "model_geometry_body_count": geometry_result.get("body_count"),
+        "model_geometry_measured_dimensions_mm": geometry_result.get("measured_dimensions_mm"),
+        "mass_property_status": diagnostics.get("mass_property_status"),
+        "mass_kg": mass_property_result.get("mass_kg"),
+        "volume_m3": mass_property_result.get("volume_m3"),
+        "material_status": diagnostics.get("material_status"),
+        "custom_property_status": diagnostics.get("custom_property_status"),
+        "artifact_validation_status": artifact_result.get("status"),
+        "artifact_content_status": content_result.get("status"),
+        "cad_content_status": cad_content_result.get("status"),
+        "pdf_semantic_content_status": pdf_semantic_result.get("status"),
+        "export_status": export_result.get("status"),
+        "export_failed": failed_exports,
+        "missing_requested_output_files": missing_requested_output_keys,
+        "cleanup_status": cleanup_result.get("status"),
+        "cleanup_verification_status": cleanup_result.get("cleanup_verification_status"),
+        "document_state_audit_status": document_state_audit.get("status"),
+        "document_state_after_cleanup_run_created_open_count": document_state_audit.get(
+            "after_cleanup_run_created_open_count"
+        ),
+        "output_files": sorted(output_keys),
+        "preview_files": sorted(preview_keys),
+    }
+    return {
+        "status": "accepted" if not failures else "rejected",
+        "ok": not failures,
+        "checks": checks,
+        "failures": failures,
+        "repair_actions": build_repair_actions(failures, summary),
+        "summary": summary,
+        "expected": {
+            "trusted_workflow": trusted_workflow.get("status"),
+            "existing_model_status": "existing_model_imported",
+            "drawing_view_status": "created",
+            "required_drawing_view_roles": sorted(REQUIRED_DRAWING_VIEW_ROLES),
+            "drawing_layout_status": "layout_verified",
+            "drawing_layout_clipped_view_count": 0,
+            "drawing_dimension_status": "basic_dimensions_created",
+            "required_dimensions": sorted(required_dimensions),
+            "dimension_layout_status": [
+                "existing_model_overall_annotations_created",
+                "existing_model_overall_dimensions_created",
+                "imported_model_dimensions_created",
+            ],
+            "existing_model_note_status": "existing_model_note_created",
+            "model_geometry_status": "geometry_verified",
+            "mass_property_status": "mass_properties_verified",
+            "required_output_files": sorted(required_output_keys),
             "requested_output_files": sorted(requested_output_keys),
             "required_preview_files": sorted(REQUIRED_PREVIEW_KEYS),
             "cleanup_status": ["completed", "skipped_no_documents"],
@@ -2045,7 +2252,11 @@ def _validate_cad_artifact_content(
 ) -> dict[str, Any]:
     """Validate exported CAD files beyond existence and byte size."""
 
-    required = ("sldasm", "step", "dwg", "csv") if "sldasm" in output_files else ("sldprt", "step", "stl", "slddrw", "dwg")
+    requested_required = tuple(
+        artifact_id
+        for artifact_id in ("sldasm", "sldprt", "step", "stl", "slddrw", "dwg", "csv")
+        if artifact_id in output_files
+    )
     requested_optional = tuple(
         artifact_id
         for artifact_id in sorted(OPTIONAL_CAD_CONTENT_KEYS)
@@ -2053,10 +2264,10 @@ def _validate_cad_artifact_content(
     )
     checks = [
         _inspect_cad_artifact(artifact_id, Path(output_files[artifact_id]))
-        for artifact_id in (*required, *requested_optional)
+        for artifact_id in (*requested_required, *requested_optional)
         if artifact_id in output_files
     ]
-    missing = [artifact_id for artifact_id in required if artifact_id not in output_files]
+    missing: list[str] = []
     failed = [
         {"id": check["id"], "status": check["status"], "path": check["path"]}
         for check in checks
@@ -2138,14 +2349,29 @@ def _inspect_csv_content(data: bytes) -> dict[str, Any]:
     text = data.decode("utf-8", errors="ignore")
     lines = [line for line in text.splitlines() if line.strip()]
     header = lines[0].lower() if lines else ""
-    tabular_manufacturing = "quantity" in header and ("part_number" in header or "component_id" in header)
+    bom_table = "quantity" in header and ("part_number" in header or "component_id" in header)
+    cut_list_table = (
+        "quantity" in header
+        and "member_id" in header
+        and "length_mm" in header
+        and "profile" in header
+    )
     simulation_report = "metric" in header and "value" in header and "status" in header
-    valid = len(lines) >= 2 and (tabular_manufacturing or simulation_report)
+    valid = len(lines) >= 2 and (bom_table or cut_list_table or simulation_report)
+    csv_kind = (
+        "simulation_report"
+        if simulation_report
+        else "cut_list"
+        if cut_list_table
+        else "manufacturing_table"
+        if bom_table
+        else None
+    )
     return {
         "status": "csv_readable" if valid else "csv_invalid",
         "ok": valid,
         "line_count": len(lines),
-        "csv_kind": "simulation_report" if simulation_report else "manufacturing_table" if tabular_manufacturing else None,
+        "csv_kind": csv_kind,
     }
 
 
@@ -2341,6 +2567,7 @@ def _requires_hole_callout(plan: ModelPlan) -> bool:
         and sheet_metal_base_flange_parameters_from_plan(plan) is None
         and weldment_frame_parameters_from_plan(plan) is None
         and static_simulation_parameters_from_plan(plan) is None
+        and existing_model_parameters_from_plan(plan) is None
     )
 
 
@@ -2363,6 +2590,7 @@ def _trusted_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         _trusted_sleeve_workflow_result(plan),
         _trusted_slotted_array_plate_workflow_result(plan),
         _trusted_bom_assembly_workflow_result(plan),
+        _trusted_existing_model_workflow_result(plan),
         atomic_workflow,
     ):
         if workflow_result["ok"]:
@@ -2375,12 +2603,12 @@ def _trusted_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         "ok": False,
         "status": "unsupported_workflow",
         "workflow": "unsupported",
-        "allowed_workflows": ["bracket", "mounting_plate", "center_hole_flange", "center_hole_plate", "end_cap", "mounting_block", "shaft", "sheet_metal_base_flange", "weldment_frame", "static_simulation", "washer", "sleeve", "slotted_array_plate", "bom_assembly", "atomic_model"],
+        "allowed_workflows": ["bracket", "mounting_plate", "center_hole_flange", "center_hole_plate", "end_cap", "mounting_block", "shaft", "sheet_metal_base_flange", "weldment_frame", "static_simulation", "washer", "sleeve", "slotted_array_plate", "bom_assembly", "existing_model", "atomic_model"],
         "operation_sequence": operation_names,
         "untrusted_operations": sorted(set(operation_names)),
         "failure_reason": (
             "Trusted production acceptance requires exactly one controlled geometry operation: "
-            "create_bracket, create_mounting_plate, create_center_hole_flange, create_center_hole_plate, create_end_cap, create_mounting_block, create_shaft, create_sheet_metal_base_flange, create_weldment_frame, run_static_simulation, create_washer, create_sleeve, create_slotted_array_plate, create_bom_assembly, "
+            "create_bracket, create_mounting_plate, create_center_hole_flange, create_center_hole_plate, create_end_cap, create_mounting_block, create_shaft, create_sheet_metal_base_flange, create_weldment_frame, run_static_simulation, create_washer, create_sleeve, create_slotted_array_plate, create_bom_assembly, import_existing_model, "
             "or an atomic_model_session metadata marker with only production atomic operations."
         ),
     }
@@ -2804,6 +3032,56 @@ def _trusted_bom_assembly_workflow_result(plan: ModelPlan) -> dict[str, Any]:
     }
 
 
+def _trusted_existing_model_workflow_result(plan: ModelPlan) -> dict[str, Any]:
+    """Return whether the plan imports an existing SolidWorks model for controlled drawing export."""
+
+    operation_names = [operation.op for operation in plan.operations]
+    import_count = operation_names.count("import_existing_model")
+    untrusted_operations = sorted(set(operation_names) - TRUSTED_EXISTING_MODEL_OPERATIONS)
+    params = existing_model_parameters_from_plan(plan)
+    has_drawing = plan.drawing_profile.enabled
+    drawing_outputs = set(plan.drawing_profile.export_formats)
+    has_required_drawing_exports = {"pdf", "dwg"}.issubset(drawing_outputs)
+    native_output = "sldasm" if params and params.get("document_type") == "assembly" else "sldprt"
+    has_native_output = native_output in plan.output_formats
+    ok = (
+        import_count == 1
+        and not untrusted_operations
+        and params is not None
+        and has_drawing
+        and has_required_drawing_exports
+        and has_native_output
+    )
+    failure_reason = None
+    if import_count != 1:
+        failure_reason = "Trusted existing-model drawing acceptance requires exactly one import_existing_model operation."
+    elif untrusted_operations:
+        failure_reason = (
+            "Trusted existing-model drawing acceptance does not allow extra freeform operations: "
+            + ", ".join(untrusted_operations)
+        )
+    elif params is None:
+        failure_reason = "Trusted existing-model drawing acceptance requires valid import_existing_model parameters."
+    elif not has_drawing:
+        failure_reason = "Trusted existing-model drawing acceptance requires drawing_profile.enabled=true."
+    elif not has_required_drawing_exports:
+        failure_reason = "Trusted existing-model drawing acceptance requires drawing_profile.export_formats to include pdf and dwg."
+    elif not has_native_output:
+        failure_reason = f"Trusted existing-model drawing acceptance requires {native_output} in output_formats."
+    return {
+        "ok": ok,
+        "status": "controlled_existing_model_drawing" if ok else "unsupported_workflow",
+        "workflow": "existing_model",
+        "existing_model_operation_count": import_count,
+        "document_type": params.get("document_type") if params else None,
+        "native_output_required": native_output,
+        "allowed_operations": sorted(TRUSTED_EXISTING_MODEL_OPERATIONS),
+        "operation_sequence": operation_names,
+        "untrusted_operations": untrusted_operations,
+        "failure_reason": failure_reason,
+    }
+
+
 def _trusted_atomic_workflow_result(plan: ModelPlan) -> dict[str, Any]:
     """Return whether the plan belongs to a staged production atomic session."""
 
@@ -2915,6 +3193,23 @@ def _positive_number(value: Any) -> bool:
         return float(value) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _positive_int(value: Any) -> int:
+    """Return a non-negative diagnostic integer value."""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(number, 0)
+
+
+def _existing_model_note_has_overall_size_evidence(note_result: dict[str, Any]) -> bool:
+    """Return whether the imported-model drawing note includes overall size evidence."""
+
+    text = str(note_result.get("text") or "").lower()
+    return "overall size" in text and "x " in text and "y " in text and "z " in text
 
 
 def _validate_pdf_semantic_content(plan: ModelPlan, pdf_checks: list[dict[str, Any]]) -> dict[str, Any]:

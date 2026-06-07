@@ -316,6 +316,9 @@ def _current_acceptance_gate_failures(
         "simulation_study_verified": _simulation_study_evidence_ok(diagnostics),
         "simulation_results_within_limits": _simulation_limits_evidence_ok(diagnostics),
         "simulation_report_verified": _simulation_report_evidence_ok(diagnostics),
+        "existing_model_imported": _existing_model_import_evidence_ok(diagnostics),
+        "drawing_views_not_clipped": _drawing_view_layout_evidence_ok(diagnostics),
+        "existing_model_overall_note_created": _existing_model_overall_note_evidence_ok(diagnostics),
         "model_geometry_verified": _model_geometry_evidence_ok(diagnostics),
         "mass_properties_verified": _mass_property_evidence_ok(diagnostics),
         "cleanup_completed": _cleanup_completed_evidence_ok(diagnostics),
@@ -456,6 +459,32 @@ def _current_production_gate_ids(stored_acceptance: dict[str, Any]) -> tuple[str
             "cleanup_verified",
             "document_state_audit_verified",
         )
+    if summary.get("trusted_workflow_status") == "controlled_existing_model_drawing":
+        return (
+            "execution_ok",
+            "trusted_controlled_workflow",
+            "preflight_ready",
+            "existing_model_imported",
+            "drawing_standard_views_created",
+            "drawing_views_not_clipped",
+            "existing_model_overall_note_created",
+            "basic_dimensions_created",
+            "trusted_basic_dimensions",
+            "material_verified",
+            "custom_properties_verified",
+            "model_geometry_verified",
+            "mass_properties_verified",
+            "artifacts_ready",
+            "artifact_content_ready",
+            "cad_artifact_content",
+            "drawing_pdf_semantic_content",
+            "required_output_files",
+            "requested_output_files",
+            "required_preview_files",
+            "cleanup_completed",
+            "cleanup_verified",
+            "document_state_audit_verified",
+        )
     return (
         "execution_ok",
         "trusted_controlled_workflow",
@@ -498,6 +527,7 @@ def _stored_acceptance_has_no_hole_callout_requirement(stored_acceptance: dict[s
             "controlled_sheet_metal_base_flange",
             "controlled_weldment_frame",
             "controlled_static_simulation",
+            "controlled_existing_model_drawing",
         }
         and summary.get("drawing_annotation_status") == "not_requested"
     )
@@ -556,10 +586,66 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
     result = _as_dict(diagnostics.get("drawing_dimension_result"))
     created = [item for item in result.get("created_dimensions", []) or [] if isinstance(item, dict)]
     proxy_dimensions = [item for item in created if item.get("proxy_dimension") is True]
+    trusted_statuses = {
+        "trusted_dimensions_created",
+        "existing_model_overall_annotations_created",
+        "existing_model_overall_dimensions_created",
+        "imported_model_dimensions_created",
+    }
+    if result.get("dimension_layout_status") == "existing_model_overall_annotations_created":
+        created_ids = {str(item.get("id")) for item in created if item.get("id")}
+        display_count = _safe_positive_int(result.get("display_dimension_count"))
+        return (
+            _basic_dimension_evidence_ok(diagnostics)
+            and "overall_outer_diameter" in created_ids
+            and "overall_size_note" in created_ids
+            and display_count >= 1
+            and result.get("overall_note_created") is True
+            and _existing_model_overall_note_evidence_ok(diagnostics)
+            and not proxy_dimensions
+        )
     return (
         _basic_dimension_evidence_ok(diagnostics)
-        and result.get("dimension_layout_status") == "trusted_dimensions_created"
+        and result.get("dimension_layout_status") in trusted_statuses
         and not proxy_dimensions
+    )
+
+
+def _existing_model_import_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether diagnostics prove an existing model was isolated into the run directory."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    result = _as_dict(diagnostics.get("existing_model_result"))
+    return result.get("status") == "existing_model_imported" and result.get("copied_to_run_dir") is True
+
+
+def _drawing_view_layout_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether drawing-view layout evidence proves no view is clipped."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    result = _as_dict(diagnostics.get("drawing_view_result"))
+    layout = _as_dict(result.get("layout"))
+    try:
+        clipped_count = int(layout.get("clipped_view_count") or 0)
+    except (TypeError, ValueError):
+        clipped_count = -1
+    return layout.get("status") == "layout_verified" and clipped_count == 0
+
+
+def _existing_model_overall_note_evidence_ok(diagnostics: Any) -> bool:
+    """Return whether diagnostics prove a visible imported-model overall-size note."""
+
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    metadata_note = _as_dict(diagnostics.get("drawing_metadata_note_result"))
+    note = _as_dict(metadata_note.get("existing_model_note"))
+    text = str(note.get("text") or "").lower()
+    return (
+        metadata_note.get("status") == "existing_model_note_created"
+        and note.get("status") == "existing_model_note_created"
+        and "overall size" in text
+        and "x " in text
+        and "y " in text
+        and "z " in text
     )
 
 
@@ -773,6 +859,16 @@ def _positive_number(value: Any) -> bool:
         return float(value) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _safe_positive_int(value: Any) -> int:
+    """Return a non-negative integer for diagnostic counters."""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(number, 0)
 
 
 def _current_gate_repair_actions(failures: list[str], summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -991,9 +1087,12 @@ def _acceptance_summary(
     cleanup = _as_dict(diagnostics.get("cleanup_result"))
     drawing_annotation = _as_dict(diagnostics.get("drawing_annotation_result"))
     drawing_dimensions = _as_dict(diagnostics.get("drawing_dimension_result"))
+    drawing_views = _as_dict(diagnostics.get("drawing_view_result"))
+    drawing_layout = _as_dict(drawing_views.get("layout"))
     drawing_metadata = _as_dict(diagnostics.get("drawing_metadata_note_result"))
     geometry = _as_dict(diagnostics.get("model_geometry_result"))
     mass_properties = _as_dict(diagnostics.get("mass_property_result"))
+    existing_model = _as_dict(diagnostics.get("existing_model_result"))
     material = _as_dict(diagnostics.get("material_result"))
     custom_properties = _as_dict(diagnostics.get("custom_property_result"))
     assembly = _as_dict(diagnostics.get("assembly_result"))
@@ -1015,6 +1114,12 @@ def _acceptance_summary(
         "drawing_view_roles": summary.get("drawing_view_roles"),
         "missing_drawing_view_roles": summary.get("missing_drawing_view_roles"),
         "drawing_view_errors": summary.get("drawing_view_errors"),
+        "drawing_layout_status": summary.get("drawing_layout_status") or drawing_layout.get("status"),
+        "drawing_clipped_view_count": summary.get("drawing_clipped_view_count")
+        if "drawing_clipped_view_count" in summary
+        else summary.get("drawing_layout_clipped_view_count")
+        if "drawing_layout_clipped_view_count" in summary
+        else drawing_layout.get("clipped_view_count"),
         "drawing_annotation_status": diagnostics.get("drawing_annotation_status"),
         "callout_creation_method": drawing_annotation.get("callout_creation_method"),
         "direct_hole_callout_created": drawing_annotation.get("direct_hole_callout_created"),
@@ -1028,6 +1133,8 @@ def _acceptance_summary(
         or drawing_dimensions.get("missing_dimensions", []),
         "drawing_metadata_note_status": drawing_metadata.get("status"),
         "drawing_metadata_note_method": drawing_metadata.get("method"),
+        "existing_model_status": summary.get("existing_model_status") or existing_model.get("status"),
+        "existing_model_run_path": summary.get("existing_model_run_path") or existing_model.get("run_model_path"),
         "model_geometry_status": diagnostics.get("model_geometry_status"),
         "model_geometry_max_error_mm": geometry.get("max_error_mm"),
         "mass_property_status": diagnostics.get("mass_property_status"),

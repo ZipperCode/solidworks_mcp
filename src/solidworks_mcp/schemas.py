@@ -65,6 +65,7 @@ SUPPORTED_OPERATIONS = {
     "hole",
     "fillet",
     "chamfer",
+    "import_existing_model",
     "linear_pattern",
     "circular_pattern",
     "revolve",
@@ -99,6 +100,9 @@ class DrawingProfile:
     include_isometric: bool = True
     include_basic_dimensions: bool = True
     export_formats: tuple[str, ...] = ("pdf", "dwg")
+    auto_layout: bool = True
+    margin_mm: float = 18.0
+    title_block_height_mm: float = 42.0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "DrawingProfile":
@@ -129,6 +133,13 @@ class DrawingProfile:
             include_isometric=bool(raw.get("include_isometric", True)),
             include_basic_dimensions=bool(raw.get("include_basic_dimensions", True)),
             export_formats=export_formats,
+            auto_layout=bool(raw.get("auto_layout", True)),
+            margin_mm=_positive_float_or_default(raw.get("margin_mm"), 18.0, "drawing_profile.margin_mm"),
+            title_block_height_mm=_positive_float_or_default(
+                raw.get("title_block_height_mm"),
+                42.0,
+                "drawing_profile.title_block_height_mm",
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,6 +153,9 @@ class DrawingProfile:
             "include_isometric": self.include_isometric,
             "include_basic_dimensions": self.include_basic_dimensions,
             "export_formats": list(self.export_formats),
+            "auto_layout": self.auto_layout,
+            "margin_mm": self.margin_mm,
+            "title_block_height_mm": self.title_block_height_mm,
         }
 
 
@@ -477,6 +491,7 @@ def _validate_required_operation_fields(op: str, parameters: dict[str, Any], ind
         "hole": ("position", "diameter", "depth"),
         "fillet": ("radius",),
         "chamfer": ("distance",),
+        "import_existing_model": ("path",),
         "linear_pattern": ("seed_id", "direction", "spacing", "count"),
         "circular_pattern": ("seed_id", "axis", "count"),
         "revolve": ("sketch_id", "axis", "angle"),
@@ -543,6 +558,46 @@ def _validate_required_operation_fields(op: str, parameters: dict[str, Any], ind
         _validate_atomic_reference_fields(op, parameters, index)
     if op == "run_static_simulation":
         _validate_static_simulation_fields(parameters, index)
+    if op == "import_existing_model":
+        _validate_existing_model_fields(parameters, index)
+
+
+def _validate_existing_model_fields(parameters: dict[str, Any], index: int) -> None:
+    """Validate an existing SolidWorks model import request."""
+
+    raw_path = parameters.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise PlanValidationError(f"operations[{index}].parameters.path must be a non-empty string")
+    path = Path(raw_path)
+    suffix = path.suffix.lower()
+    if suffix not in {".sldprt", ".sldasm"}:
+        raise PlanValidationError(
+            f"operations[{index}].parameters.path must point to a .sldprt or .sldasm file"
+        )
+    if not path.exists():
+        raise PlanValidationError(f"operations[{index}].parameters.path does not exist: {raw_path}")
+    if not path.is_file():
+        raise PlanValidationError(f"operations[{index}].parameters.path must be a file: {raw_path}")
+
+    copy_to_run_dir = parameters.get("copy_to_run_dir", True)
+    if not isinstance(copy_to_run_dir, bool):
+        raise PlanValidationError(f"operations[{index}].parameters.copy_to_run_dir must be boolean when provided")
+
+    document_type = parameters.get("document_type")
+    if document_type is not None:
+        document_type = str(document_type).lower()
+        if document_type not in {"part", "assembly"}:
+            raise PlanValidationError(
+                f"operations[{index}].parameters.document_type must be part or assembly when provided"
+            )
+        if suffix == ".sldprt" and document_type != "part":
+            raise PlanValidationError(
+                f"operations[{index}].parameters.document_type=assembly conflicts with .sldprt path"
+            )
+        if suffix == ".sldasm" and document_type != "assembly":
+            raise PlanValidationError(
+                f"operations[{index}].parameters.document_type=part conflicts with .sldasm path"
+            )
 
 
 def _validate_atomic_geometry_fields(op: str, parameters: dict[str, Any], index: int) -> None:
@@ -1904,6 +1959,30 @@ def bom_assembly_parameters_from_plan(plan: "ModelPlan") -> dict[str, Any] | Non
     return None
 
 
+def existing_model_parameters_from_plan(plan: "ModelPlan") -> dict[str, Any] | None:
+    """Extract existing model import parameters from a plan."""
+
+    for operation in plan.operations:
+        if operation.op != "import_existing_model":
+            continue
+        path = Path(str(operation.parameters["path"]))
+        suffix = path.suffix.lower()
+        document_type = str(
+            operation.parameters.get(
+                "document_type",
+                "assembly" if suffix == ".sldasm" else "part",
+            )
+        ).lower()
+        return {
+            "path": path_to_string(path),
+            "document_type": document_type,
+            "copy_to_run_dir": bool(operation.parameters.get("copy_to_run_dir", True)),
+            "source_name": path.name,
+            "source_suffix": suffix,
+        }
+    return None
+
+
 def washer_basic_dimension_ids_from_plan(plan: "ModelPlan") -> list[str]:
     """Return required washer drawing-dimension ids, or an empty list."""
 
@@ -2242,6 +2321,20 @@ def _parse_string_list(raw: Any, field_name: str) -> tuple[str, ...]:
     if not values:
         raise PlanValidationError(f"{field_name} must not be empty")
     return values
+
+
+def _positive_float_or_default(raw: Any, default: float, field_name: str) -> float:
+    """Parse a strictly positive finite float, using the default when omitted."""
+
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise PlanValidationError(f"{field_name} must be a positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise PlanValidationError(f"{field_name} must be a positive number")
+    return value
 
 
 def safe_output_name(name: str) -> str:
