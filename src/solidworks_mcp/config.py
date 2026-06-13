@@ -38,6 +38,7 @@ class SolidWorksMCPConfig:
     cleanup_attach_only: bool
     debug_level: str
     run_id: str | None
+    docmgr_license: str = ""
     force_export_failure: bool = False
     force_model_geometry_failure: bool = False
 
@@ -98,6 +99,7 @@ class SolidWorksMCPConfig:
             not in {"0", "false", "False"},
             debug_level=debug_level,
             run_id=os.getenv("SOLIDWORKS_MCP_RUN_ID") or None,
+            docmgr_license=os.environ.get("SOLIDWORKS_MCP_DOCMGR_LICENSE", ""),
             force_export_failure=os.getenv("SOLIDWORKS_MCP_FORCE_EXPORT_FAILURE", "0").strip()
             in {"1", "true", "True"},
             force_model_geometry_failure=os.getenv("SOLIDWORKS_MCP_FORCE_MODEL_GEOMETRY_FAILURE", "0").strip()

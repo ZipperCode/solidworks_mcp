@@ -183,6 +183,12 @@ class ModelPlanExecutor:
 
         return self._adapter.name
 
+    @property
+    def adapter(self) -> Any:
+        """Return the active CAD adapter for direct MCP adapter tools."""
+
+        return self._adapter
+
     def connect(self) -> dict[str, Any]:
         """Connect to the configured CAD backend."""
 

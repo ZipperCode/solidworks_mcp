@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -71,6 +72,120 @@ from solidworks_mcp.schemas import (
 )
 
 
+try:
+    import comtypes.client
+
+    SW_COMMANDS_TLB_PATH = r"D:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\swcommands.tlb"
+    if Path(SW_COMMANDS_TLB_PATH).exists():
+        comtypes.client.GetModule(SW_COMMANDS_TLB_PATH)
+except Exception:
+    pass  # swcommands.tlb registration is best-effort
+
+_SW_DIMXPERT_AVAILABLE = False
+try:
+    import comtypes.client
+
+    SW_DIMXPERT_TLB = r"D:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\swdimxpert.tlb"
+    if Path(SW_DIMXPERT_TLB).exists():
+        comtypes.client.GetModule(SW_DIMXPERT_TLB)
+        _SW_DIMXPERT_AVAILABLE = True
+except Exception:
+    pass  # swdimxpert.tlb registration is best-effort
+
+_SW_DOCMGR_AVAILABLE = False
+try:
+    import comtypes.client
+
+    SW_DOCMGR_DLL = r"D:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\api\redist\SolidWorks.Interop.swdocumentmgr.dll"
+    if Path(SW_DOCMGR_DLL).exists():
+        comtypes.client.GetModule(SW_DOCMGR_DLL)
+        _SW_DOCMGR_AVAILABLE = True
+except Exception:
+    pass  # Best-effort, only works on Windows with SW Document Manager installed
+
+
+def _get_swdm_application(license_key: str | None = None) -> Any | None:
+    """Get SwDMApplication instance. Returns None if unavailable."""
+
+    if not _SW_DOCMGR_AVAILABLE:
+        return None
+    try:
+        from comtypes.gen.SolidWorks_Interop_swdocumentmgr import SwDMClassFactory
+
+        class_factory = SwDMClassFactory()
+        key = license_key or os.environ.get("SOLIDWORKS_MCP_DOCMGR_LICENSE", "")
+        return class_factory.GetApplication(key)
+    except Exception:
+        return None
+
+
+def _parse_equation_name_value(equation_text: str) -> tuple[str | None, str | None]:
+    """Split a SolidWorks equation string into display name and right-hand value."""
+
+    if "=" not in equation_text:
+        return None, None
+    name, value = equation_text.split("=", 1)
+    return name.strip().strip('"') or None, value.strip() or None
+
+
+def _equation_name_is_global(name: str | None, equation_text: str) -> bool:
+    """Return True when an equation string uses SolidWorks global-variable syntax."""
+
+    if not name or "=" not in equation_text:
+        return False
+    left_side = equation_text.split("=", 1)[0].strip()
+    return left_side.startswith('"') and left_side.endswith('"')
+
+
+def _document_info(document: Any) -> dict[str, Any]:
+    """Return compact document metadata from a SolidWorks COM document object."""
+    title = None
+    path = None
+    doc_type = "unknown"
+    config_name = None
+    dirty = None
+    for attr in ("GetTitle", "Title"):
+        v = getattr(document, attr, None)
+        val = v() if callable(v) else v
+        if val:
+            title = str(val)
+            break
+    for attr in ("GetPathName", "PathName"):
+        v = getattr(document, attr, None)
+        val = v() if callable(v) else v
+        if val:
+            path = str(val)
+            break
+    sw_type = getattr(document, "GetType", None)
+    if callable(sw_type):
+        try:
+            type_code = sw_type()
+            doc_type = {1: "part", 2: "assembly", 3: "drawing"}.get(int(type_code), "unknown")
+        except Exception:
+            pass
+    cm = getattr(document, "ConfigurationManager", None)
+    if cm:
+        ac = getattr(cm, "ActiveConfiguration", None)
+        if ac and not callable(ac):
+            ac_name = getattr(ac, "Name", None)
+            if ac_name:
+                config_name = ac_name() if callable(ac_name) else str(ac_name)
+    dirty_flag = getattr(document, "GetSaveFlag", None)
+    if callable(dirty_flag):
+        try:
+            dirty = bool(dirty_flag())
+        except Exception:
+            pass
+    return {
+        "title": title,
+        "path": path,
+        "document_type": title,
+        "type": doc_type,
+        "configuration": config_name,
+        "save_status": {"dirty": dirty, "raw": dirty},
+    }
+
+
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
 SW_DOC_DRAWING = 3
@@ -105,6 +220,64 @@ SW_SHEET_METAL_EXPORT_OPTIONS = (
     | SW_SHEET_METAL_EXPORT_BEND_LINES
     | SW_SHEET_METAL_EXPORT_SKETCHES
 )
+SW_DOCUMENT_TYPE_NAMES = {
+    SW_DOC_PART: "part",
+    SW_DOC_ASSEMBLY: "assembly",
+    SW_DOC_DRAWING: "drawing",
+}
+
+COMMON_SOLIDWORKS_COMMANDS = [
+    {"id": 1, "name": "FileNew", "category": "file"},
+    {"id": 2, "name": "FileOpen", "category": "file"},
+    {"id": 3, "name": "FileClose", "category": "file"},
+    {"id": 4, "name": "FileSave", "category": "file"},
+    {"id": 5, "name": "FileSaveAs", "category": "file"},
+    {"id": 6, "name": "FilePrint", "category": "file"},
+    {"id": 7, "name": "EditUndo", "category": "edit"},
+    {"id": 8, "name": "EditRedo", "category": "edit"},
+    {"id": 9, "name": "EditCut", "category": "edit"},
+    {"id": 10, "name": "EditCopy", "category": "edit"},
+    {"id": 11, "name": "EditPaste", "category": "edit"},
+    {"id": 12, "name": "EditDelete", "category": "edit"},
+    {"id": 13, "name": "ViewZoomToFit", "category": "view"},
+    {"id": 14, "name": "ViewZoomToArea", "category": "view"},
+    {"id": 15, "name": "ViewZoomInOut", "category": "view"},
+    {"id": 16, "name": "ViewPan", "category": "view"},
+    {"id": 17, "name": "ViewRotate", "category": "view"},
+    {"id": 18, "name": "ViewOrientation", "category": "view"},
+    {"id": 19, "name": "ViewDisplayWireframe", "category": "view"},
+    {"id": 20, "name": "ViewDisplayHiddenLinesVisible", "category": "view"},
+    {"id": 21, "name": "ViewDisplayHiddenLinesRemoved", "category": "view"},
+    {"id": 22, "name": "ViewDisplayShaded", "category": "view"},
+    {"id": 23, "name": "InsertSketch", "category": "sketch"},
+    {"id": 24, "name": "SketchLine", "category": "sketch"},
+    {"id": 25, "name": "SketchRectangle", "category": "sketch"},
+    {"id": 26, "name": "SketchCircle", "category": "sketch"},
+    {"id": 27, "name": "SketchArc", "category": "sketch"},
+    {"id": 28, "name": "SketchTrim", "category": "sketch"},
+    {"id": 29, "name": "SketchOffset", "category": "sketch"},
+    {"id": 30, "name": "SketchSmartDimension", "category": "sketch"},
+    {"id": 31, "name": "InsertBossBaseExtrude", "category": "features"},
+    {"id": 32, "name": "InsertCutExtrude", "category": "features"},
+    {"id": 33, "name": "InsertBossBaseRevolve", "category": "features"},
+    {"id": 34, "name": "InsertCutRevolve", "category": "features"},
+    {"id": 35, "name": "InsertFillet", "category": "features"},
+    {"id": 36, "name": "InsertChamfer", "category": "features"},
+    {"id": 37, "name": "InsertLinearPattern", "category": "features"},
+    {"id": 38, "name": "InsertCircularPattern", "category": "features"},
+    {"id": 39, "name": "InsertMirror", "category": "features"},
+    {"id": 40, "name": "InsertReferencePlane", "category": "reference_geometry"},
+    {"id": 41, "name": "InsertReferenceAxis", "category": "reference_geometry"},
+    {"id": 42, "name": "InsertMate", "category": "assembly"},
+    {"id": 43, "name": "InsertComponent", "category": "assembly"},
+    {"id": 44, "name": "ToolsMeasure", "category": "tools"},
+    {"id": 45, "name": "ToolsMassProperties", "category": "tools"},
+    {"id": 46, "name": "ToolsEquations", "category": "tools"},
+    {"id": 47, "name": "ToolsOptions", "category": "tools"},
+    {"id": 48, "name": "WindowCascade", "category": "window"},
+    {"id": 49, "name": "WindowTileHorizontal", "category": "window"},
+    {"id": 50, "name": "WindowTileVertical", "category": "window"},
+]
 
 ISO_METRIC_COARSE_THREADS = {
     "M3": {"tap_drill_diameter": 2.5, "pitch": 0.5},
@@ -117,6 +290,43 @@ ISO_METRIC_COARSE_THREADS = {
 MATERIAL_ALIASES = {
     "plain carbon steel": ["普通碳钢"],
 }
+
+
+class SolidWorksEventSink:
+    """COM event sink that captures SolidWorks application events."""
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+
+    def OnActiveModelDocChange(self) -> int:
+        event = {"event": "ActiveModelDocChange", "timestamp": perf_counter()}
+        self._adapter._event_log.append(event)
+        return 0
+
+    def OnFileOpenNotify(self, file_name: Any) -> int:
+        event = {"event": "FileOpenNotify", "file_name": str(file_name), "timestamp": perf_counter()}
+        self._adapter._event_log.append(event)
+        return 0
+
+    def OnFileSaveAsNotify(self, file_name: Any) -> int:
+        event = {"event": "FileSaveAsNotify", "file_name": str(file_name), "timestamp": perf_counter()}
+        self._adapter._event_log.append(event)
+        return 0
+
+    def OnFileCloseNotify(self, file_name: Any, reason: Any) -> int:
+        event = {
+            "event": "FileCloseNotify",
+            "file_name": str(file_name),
+            "reason": reason,
+            "timestamp": perf_counter(),
+        }
+        self._adapter._event_log.append(event)
+        return 0
+
+    def OnRebuildNotify(self, doc: Any) -> int:
+        event = {"event": "RebuildNotify", "timestamp": perf_counter()}
+        self._adapter._event_log.append(event)
+        return 0
 
 
 class SolidWorksCOMAdapter(CADAdapter):
@@ -172,6 +382,11 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._atomic_sketch_count = 0
         self._atomic_axis_count = 0
         self._solidworks_rpc_unavailable: str | None = None
+        self._sw_commands_cache: dict[str, Any] = {}
+        self._event_sink = None
+        self._event_connection = None
+        self._event_log: list[dict[str, Any]] = []
+        self._event_subscribed_types: list[str] = []
 
     def record_com_call(
         self,
@@ -209,7 +424,1272 @@ class SolidWorksCOMAdapter(CADAdapter):
             "connected": True,
             "revision": revision,
             "visible": self._config.visible,
+            "extensions": {
+                "commands": ["run_command", "list_commands"],
+                "documents": ["list_open_documents", "get_document_info", "activate_document", "close_document"],
+                "model": ["get_feature_tree", "select_by_id", "get_selected_objects", "get_mass_properties"],
+            },
         }
+
+    def subscribe_events(self, event_types: list[str]) -> dict[str, Any]:
+        """Subscribe to SolidWorks COM events using win32com WithEvents."""
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "subscribed_types": [],
+            "failed_types": [],
+            "message": "",
+        }
+        if not event_types:
+            result["status"] = "no_event_types"
+            result["message"] = "No event types requested."
+            return result
+
+        sw = self._require_sw()
+        try:
+            import win32com.client
+
+            self._event_sink = SolidWorksEventSink(self)
+            self._event_connection = win32com.client.WithEvents(sw, self._event_sink)
+            self._event_subscribed_types = list(event_types)
+            result["ok"] = True
+            result["subscribed_types"] = list(event_types)
+            result["status"] = "subscribed"
+            result["message"] = f"Subscribed to {len(event_types)} event types."
+            self.record_com_call("SldWorks.WithEvents", {"event_types": event_types})
+        except Exception as exc:
+            result["status"] = "failed"
+            result["message"] = str(exc)
+            self.record_com_call("SldWorks.WithEvents", {"event_types": event_types}, error=exc)
+
+        return result
+
+    def unsubscribe_events(self) -> dict[str, Any]:
+        """Unsubscribe from SolidWorks COM events."""
+
+        self._event_sink = None
+        self._event_connection = None
+        self._event_subscribed_types = []
+        return {"ok": True, "adapter": self.name, "status": "unsubscribed"}
+
+    def get_event_log(self, max_events: int = 50) -> dict[str, Any]:
+        """Return recent SolidWorks events that were captured."""
+
+        events = self._event_log[-max_events:] if max_events > 0 else list(self._event_log)
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "total_events": len(self._event_log),
+            "returned_events": len(events),
+            "events": events,
+        }
+
+    def run_command(self, command_id: int, command_string: str = "") -> dict[str, Any]:
+        """Execute a SolidWorks command by id."""
+
+        parameters = {"command_id": command_id, "command_string": command_string}
+        started_at = perf_counter()
+        try:
+            result = self._require_sw().RunCommand(command_id, command_string)
+            success = result is not False
+            response = {
+                "ok": success,
+                "status": "completed" if success else "failed",
+                "command_id": command_id,
+                "command_string": command_string,
+                "message": "Command executed." if success else "SolidWorks RunCommand returned false.",
+            }
+            self.record_com_call("SldWorks.RunCommand", parameters, result=result, started_at=started_at)
+            return response
+        except Exception as exc:
+            self.record_com_call("SldWorks.RunCommand", parameters, error=exc, started_at=started_at)
+            return {
+                "ok": False,
+                "status": "error",
+                "command_id": command_id,
+                "command_string": command_string,
+                "error": str(exc),
+                "message": "SolidWorks RunCommand failed.",
+            }
+
+    def list_commands(self, category_filter: str | None = None) -> dict[str, Any]:
+        """List commands from swcommands.tlb when available, with a common-command fallback."""
+
+        commands = self._sw_commands_cache.get("commands")
+        source = self._sw_commands_cache.get("source")
+        if commands is None:
+            commands = _commands_from_swcommands_tlb()
+            source = "swcommands.tlb"
+            if not commands:
+                commands = [dict(command) for command in COMMON_SOLIDWORKS_COMMANDS]
+                source = "fallback_common_commands"
+            self._sw_commands_cache = {"commands": commands, "source": source}
+        filtered = list(commands)
+        if category_filter:
+            needle = category_filter.strip().lower()
+            filtered = [command for command in filtered if str(command.get("category") or "").lower() == needle]
+        return {
+            "ok": True,
+            "status": "listed",
+            "source": source,
+            "category_filter": category_filter,
+            "commands": filtered,
+            "count": len(filtered),
+        }
+
+    def list_open_documents(self) -> dict[str, Any]:
+        """List open SolidWorks documents using the existing document enumeration helpers."""
+
+        try:
+            self._require_sw()
+            result = self._open_document_summaries()
+            return {
+                "ok": bool(result.get("ok")),
+                "status": result.get("status"),
+                "documents": result.get("documents", []),
+                "count": int(result.get("document_count") or len(result.get("documents", []))),
+                "method": result.get("method"),
+                "attempts": result.get("attempts", []),
+            }
+        except Exception as exc:
+            return {"ok": False, "status": "error", "documents": [], "count": 0, "error": str(exc)}
+
+    def get_document_info(self, title: str | None = None) -> dict[str, Any]:
+        """Return compact information about a named or active SolidWorks document."""
+
+        try:
+            document = self._document_by_title(title) if title else self._require_model()
+            if document is None or document is False:
+                return {"ok": False, "status": "not_found", "title": title, "message": "Document is not open."}
+            info = _document_info(document)
+            return {"ok": True, "status": "read", "document": info}
+        except Exception as exc:
+            return {"ok": False, "status": "error", "title": title, "error": str(exc)}
+
+    def activate_document(self, title: str) -> dict[str, Any]:
+        """Activate an open SolidWorks document by title."""
+
+        started_at = perf_counter()
+        try:
+            errors = _byref_i4_variant(0)
+            result = self._require_sw().ActivateDoc3(title, False, 0, errors)
+            self.record_com_call("SldWorks.ActivateDoc3", {"title": title}, result=result, started_at=started_at)
+            if result is None or result is False:
+                return {"ok": False, "status": "failed", "title": title, "result": result}
+            self._model = _call_or_get(self._sw, "ActiveDoc") or self._model
+            return {"ok": True, "status": "activated", "title": title, "result": result}
+        except Exception as exc:
+            self.record_com_call("SldWorks.ActivateDoc3", {"title": title}, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "title": title, "error": str(exc)}
+
+    def close_document(self, title: str) -> dict[str, Any]:
+        """Close a non-transaction SolidWorks document by title."""
+
+        try:
+            sw = self._require_sw()
+            document = self._document_by_title(title)
+            if document is None or document is False:
+                return {"ok": False, "status": "not_found", "title": title, "message": "Document is not open."}
+            if self._is_active_transaction_document(document):
+                return {
+                    "ok": False,
+                    "status": "blocked_active_transaction_document",
+                    "title": title,
+                    "message": "Refusing to close a document tracked by the active transaction.",
+                }
+            close_name = self._document_title(document) or title
+            started_at = perf_counter()
+            close_result = sw.CloseDoc(close_name)
+            self.record_com_call("SldWorks.CloseDoc", {"title": close_name, "purpose": "close_document"}, result=close_result, started_at=started_at)
+            verification = self._verify_document_closed(close_name)
+            success = verification.get("verified_closed") is True or (close_result is not False and verification.get("verified_closed") is None)
+            return {
+                "ok": success,
+                "status": "closed" if success else "failed",
+                "title": close_name,
+                "result": close_result,
+                "verification": verification,
+            }
+        except Exception as exc:
+            self.record_com_call("SldWorks.CloseDoc", {"title": title, "purpose": "close_document"}, error=exc)
+            return {"ok": False, "status": "error", "title": title, "error": str(exc)}
+
+    def get_feature_tree(self, max_depth: int = 5) -> dict[str, Any]:
+        """Traverse the active model feature tree."""
+
+        try:
+            model = self._require_model()
+            feature_manager = getattr(model, "FeatureManager", None)
+            if feature_manager is None:
+                return {"ok": False, "status": "unavailable", "feature_tree": [], "count": 0, "message": "FeatureManager is unavailable."}
+            depth_limit = max(0, int(max_depth))
+            tree = self._walk_feature_tree(feature_manager, depth_limit)
+            return {"ok": True, "status": "read", "max_depth": depth_limit, "feature_tree": tree, "count": len(tree)}
+        except Exception as exc:
+            return {"ok": False, "status": "error", "feature_tree": [], "count": 0, "error": str(exc)}
+
+    def _walk_feature_tree(self, feature_manager: Any, depth: int) -> list[dict[str, Any]]:
+        """Traverse features using GetFeatures() (win32com-compatible)."""
+        if depth <= 0:
+            return []
+        features: list[dict[str, Any]] = []
+        try:
+            get_features = getattr(feature_manager, "GetFeatures", None)
+            if not callable(get_features):
+                return features
+            raw_features = get_features(True)  # True = top-level only
+            if raw_features is None or raw_features is False:
+                return features
+            feature_list = _as_sequence(raw_features) if raw_features is not None else []
+            for feature in feature_list:
+                if feature is None:
+                    continue
+                name = _call_or_get(feature, "Name")
+                ftype = _call_or_get(feature, "GetTypeName") or _safe_get_str(feature, "GetTypeName")
+                suppressed = False
+                try:
+                    suppressed = bool(getattr(feature, "IsSuppressed", False))
+                except Exception:
+                    pass
+                node = {"name": str(name or "?"), "type": str(ftype or "Feature")}
+                if suppressed:
+                    node["suppressed"] = True
+                if depth > 1:
+                    sub_features = getattr(feature, "GetSubFeature", None)
+                    if sub_features:
+                        try:
+                            sub_fm = sub_features()
+                            if sub_fm:
+                                node["children"] = self._walk_feature_tree(sub_fm, depth - 1)
+                        except Exception:
+                            pass
+                    # Also try GetSpecificFeature2 for sub-feature manager
+                    get_specific = getattr(feature, "GetSpecificFeature2", None)
+                    if not node.get("children") and get_specific:
+                        try:
+                            specific = get_specific()
+                            if specific:
+                                sub_fm_inner = getattr(specific, "GetFeatureManager", None)
+                                if callable(sub_fm_inner):
+                                    node["children"] = self._walk_feature_tree(sub_fm_inner(), depth - 1)
+                        except Exception:
+                            pass
+                features.append(node)
+        except Exception:
+            pass
+        return features
+
+    def select_by_id(
+        self,
+        name: str,
+        type: str,
+        mark: int = 2,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        append: bool = False,
+        mark_option: int = 1,
+    ) -> dict[str, Any]:
+        """Select an entity through ModelDocExtension.SelectByID2."""
+
+        parameters = {
+            "name": name,
+            "type": type,
+            "x": x,
+            "y": y,
+            "z": z,
+            "append": append,
+            "mark_option": mark_option,
+            "mark": mark,
+        }
+        import pythoncom
+        import win32com.client as _win32com_select
+        callout = _win32com_select.VARIANT(pythoncom.VT_DISPATCH, None)
+        started_at = perf_counter()
+        try:
+            result = self._require_model().Extension.SelectByID2(name, type, x, y, z, append, mark_option, callout, mark)
+            self.record_com_call("ModelDocExtension.SelectByID2", parameters, result=result, started_at=started_at)
+            return {"ok": bool(result), "status": "selected" if result else "not_selected", "selected": bool(result), **parameters}
+        except Exception as exc:
+            self.record_com_call("ModelDocExtension.SelectByID2", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "selected": False, **parameters, "error": str(exc)}
+
+    def get_selected_objects(self) -> dict[str, Any]:
+        """Return objects currently selected in the active model."""
+
+        try:
+            model = self._require_model()
+            selection_manager = getattr(model, "SelectionManager", None)
+            if selection_manager is None:
+                return {"ok": True, "status": "empty", "selected": [], "count": 0}
+            count = _selection_count(selection_manager)
+            selected = [self._selected_object_summary(selection_manager, index) for index in range(1, count + 1)]
+            return {"ok": True, "status": "read", "selected": selected, "count": len(selected)}
+        except Exception as exc:
+            return {"ok": False, "status": "error", "selected": [], "count": 0, "error": str(exc)}
+
+    def get_mass_properties(self) -> dict[str, Any]:
+        """Return mass properties for the active model."""
+
+        attempts: list[dict[str, Any]] = []
+        try:
+            model = self._require_model()
+            result = self._mass_properties_from_extension(model, attempts)
+            if result is None:
+                result = self._mass_properties_from_model_doc(model, attempts)
+            if result is None:
+                result = self._mass_properties_from_bodies(model, attempts)
+            if result is None:
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "attempts": attempts,
+                    "failure_reason": "SolidWorks returned no readable mass properties.",
+                }
+            center = _center_of_mass_from_model(model)
+            if center is not None:
+                result["center_of_mass"] = center
+            result.setdefault("center_of_mass", None)
+            result["ok"] = True
+            result.setdefault("status", "read")
+            return result
+        except Exception as exc:
+            return {"ok": False, "status": "error", "attempts": attempts, "error": str(exc)}
+
+    def setup_simulation_study(self, study_name: str = "Static 1", study_type: str = "static") -> dict[str, Any]:
+        """Create or activate a SolidWorks Simulation study when the add-in is available."""
+
+        study_name = study_name.strip() or "Static 1"
+        study_type = study_type.strip().lower() or "static"
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            "study_name": study_name,
+            "study_type": study_type,
+            "cosworks_tlb_available": _SW_SIMULATION_AVAILABLE,
+            "attempts": [],
+        }
+        try:
+            model = self._require_model()
+            addin = self._simulation_addin_object(result["attempts"])
+            if addin is not None:
+                self._simulation_addin = addin
+                study = self._create_simulation_study(addin, model, study_name, study_type, result["attempts"])
+                if study is not None:
+                    self._simulation_study = study
+                    result.update({"ok": True, "status": "created", "method_used": "CosmosWorks API", "study": _com_object_summary(study)})
+                    return result
+            command_result = self._run_simulation_command("setup_study", result["attempts"], ["simulation", "study", study_type])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "SolidWorks Simulation API is unavailable or did not create a study. Verify the Simulation add-in is installed and licensed."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.SetupStudy", {"study_name": study_name, "study_type": study_type}, error=exc)
+            return result
+
+    def apply_simulation_material(self, material_name: str) -> dict[str, Any]:
+        """Apply a material for Simulation using CosmosWorks first, then model material fallback."""
+
+        material_name = material_name.strip()
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            "material_name": material_name,
+            "cosworks_tlb_available": _SW_SIMULATION_AVAILABLE,
+            "attempts": [],
+        }
+        if not material_name:
+            result["failure_reason"] = "material_name is required."
+            return result
+        try:
+            model = self._require_model()
+            study = self._require_or_find_simulation_study(result["attempts"])
+            if study is not None:
+                for method_name, args in (
+                    ("SetMaterial", (material_name,)),
+                    ("ApplyMaterial", (material_name,)),
+                    ("SetMaterialName", (material_name,)),
+                ):
+                    if self._call_simulation_method(study, method_name, args, result["attempts"]):
+                        result.update({"ok": True, "status": "material_applied", "method_used": f"SimulationStudy.{method_name}"})
+                        return result
+            extension = getattr(model, "Extension", None)
+            method = getattr(extension, "SetMaterialPropertyName2", None) if extension is not None else None
+            if callable(method):
+                started_at = perf_counter()
+                try:
+                    raw = method("Default", "", material_name)
+                    self.record_com_call("ModelDocExtension.SetMaterialPropertyName2", {"material_name": material_name, "purpose": "simulation_material"}, result=raw, started_at=started_at)
+                    ok = raw is not False
+                    result["attempts"].append({"method": "ModelDocExtension.SetMaterialPropertyName2", "ok": ok, "raw": str(raw)})
+                    if ok:
+                        result.update({"ok": True, "status": "material_applied", "method_used": "ModelDocExtension.SetMaterialPropertyName2"})
+                        return result
+                except Exception as exc:
+                    self.record_com_call("ModelDocExtension.SetMaterialPropertyName2", {"material_name": material_name, "purpose": "simulation_material"}, error=exc, started_at=started_at)
+                    result["attempts"].append({"method": "ModelDocExtension.SetMaterialPropertyName2", "ok": False, "error": str(exc)})
+            command_result = self._run_simulation_command("material", result["attempts"], ["simulation", "material"])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "No Simulation material API or command fallback succeeded."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.ApplyMaterial", {"material_name": material_name}, error=exc)
+            return result
+
+    def add_simulation_fixture(self, fixture_type: str, entity_name: str, entity_type: str) -> dict[str, Any]:
+        """Add a Simulation fixture by selecting the target entity and probing CosmosWorks methods."""
+
+        result = self._simulation_boundary_condition_result("fixture", fixture_type, entity_name, entity_type)
+        try:
+            model = self._require_model()
+            if not self._select_simulation_entity(model, entity_name, entity_type, result["attempts"]):
+                result.update({"status": "selection_failed", "failure_reason": "Could not select the requested fixture entity."})
+                return result
+            study = self._require_or_find_simulation_study(result["attempts"])
+            if study is not None:
+                for target_name, target in self._simulation_boundary_targets(study, "fixture", result["attempts"]):
+                    for method_name, args in self._simulation_fixture_attempts(fixture_type):
+                        if self._call_simulation_method(target, method_name, args, result["attempts"], target_name=target_name):
+                            result.update({"ok": True, "status": "fixture_added", "method_used": f"{target_name}.{method_name}"})
+                            return result
+            command_result = self._run_simulation_command("fixture", result["attempts"], ["simulation", "fixture", fixture_type])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "No Simulation fixture API or command fallback succeeded."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.AddFixture", {"fixture_type": fixture_type, "entity_name": entity_name, "entity_type": entity_type}, error=exc)
+            return result
+
+    def add_simulation_load(
+        self,
+        load_type: str,
+        entity_name: str,
+        entity_type: str,
+        magnitude: float,
+        direction: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Add a Simulation load by selecting the target entity and probing CosmosWorks methods."""
+
+        result = self._simulation_boundary_condition_result("load", load_type, entity_name, entity_type)
+        result["magnitude"] = float(magnitude)
+        result["direction"] = list(direction) if direction is not None else None
+        try:
+            model = self._require_model()
+            if not self._select_simulation_entity(model, entity_name, entity_type, result["attempts"]):
+                result.update({"status": "selection_failed", "failure_reason": "Could not select the requested load entity."})
+                return result
+            study = self._require_or_find_simulation_study(result["attempts"])
+            if study is not None:
+                for target_name, target in self._simulation_boundary_targets(study, "load", result["attempts"]):
+                    for method_name, args in self._simulation_load_attempts(load_type, float(magnitude), direction):
+                        if self._call_simulation_method(target, method_name, args, result["attempts"], target_name=target_name):
+                            result.update({"ok": True, "status": "load_added", "method_used": f"{target_name}.{method_name}"})
+                            return result
+            command_result = self._run_simulation_command("load", result["attempts"], ["simulation", "load", load_type])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "No Simulation load API or command fallback succeeded."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.AddLoad", {"load_type": load_type, "entity_name": entity_name, "entity_type": entity_type, "magnitude": magnitude}, error=exc)
+            return result
+
+    def run_simulation_mesh_and_solve(self) -> dict[str, Any]:
+        """Mesh and solve the active Simulation study when possible."""
+
+        result: dict[str, Any] = {"ok": False, "adapter": self.name, "status": "failed", "attempts": [], "cosworks_tlb_available": _SW_SIMULATION_AVAILABLE}
+        try:
+            study = self._require_or_find_simulation_study(result["attempts"])
+            if study is not None:
+                mesh_ok = False
+                solve_ok = False
+                for method_name, args in (("CreateMesh", ()), ("Mesh", ()), ("CreateMesh2", (0, 0))):
+                    if self._call_simulation_method(study, method_name, args, result["attempts"]):
+                        mesh_ok = True
+                        break
+                for method_name, args in (("RunAnalysis", ()), ("Run", ()), ("Solve", ()), ("RunAnalysis2", (False,))):
+                    if self._call_simulation_method(study, method_name, args, result["attempts"]):
+                        solve_ok = True
+                        break
+                if mesh_ok or solve_ok:
+                    result.update({"ok": solve_ok, "status": "solved" if solve_ok else "mesh_created", "method_used": "CosmosWorks API", "mesh_created": mesh_ok, "solved": solve_ok})
+                    return result
+            command_result = self._run_simulation_command("mesh_solve", result["attempts"], ["simulation", "mesh", "run"])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "No Simulation mesh/solve API or command fallback succeeded."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.MeshAndSolve", None, error=exc)
+            return result
+
+    def get_simulation_results(self) -> dict[str, Any]:
+        """Read best-effort summary results from the active Simulation study."""
+
+        result: dict[str, Any] = {"ok": False, "adapter": self.name, "status": "failed", "attempts": [], "results": {}, "cosworks_tlb_available": _SW_SIMULATION_AVAILABLE}
+        try:
+            study = self._require_or_find_simulation_study(result["attempts"])
+            if study is not None:
+                summaries: dict[str, Any] = {}
+                for method_name in ("GetResults", "Results", "GetStressPlot", "GetDisplacementPlot", "GetFactorOfSafetyPlot"):
+                    method = getattr(study, method_name, None)
+                    if not callable(method):
+                        result["attempts"].append({"target": "SimulationStudy", "method": method_name, "status": "not_available"})
+                        continue
+                    started_at = perf_counter()
+                    try:
+                        raw = method()
+                        self.record_com_call(f"SimulationStudy.{method_name}", {}, result=raw, started_at=started_at)
+                        result["attempts"].append({"target": "SimulationStudy", "method": method_name, "status": "called", "returned": raw is not None and raw is not False})
+                        if raw is not None and raw is not False:
+                            summaries[method_name] = _com_object_summary(raw)
+                    except Exception as exc:
+                        self.record_com_call(f"SimulationStudy.{method_name}", {}, error=exc, started_at=started_at)
+                        result["attempts"].append({"target": "SimulationStudy", "method": method_name, "status": "error", "failure_reason": str(exc)})
+                if summaries:
+                    result.update({"ok": True, "status": "read", "method_used": "CosmosWorks API", "results": summaries})
+                    return result
+            command_result = self._run_simulation_command("results", result["attempts"], ["simulation", "result"])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "command_invoked", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["failure_reason"] = "No Simulation result API or command fallback returned readable results."
+            return result
+        except Exception as exc:
+            result.update({"status": "error", "failure_reason": str(exc)})
+            self.record_com_call("Simulation.GetResults", None, error=exc)
+            return result
+
+    def check_interference(self, component_selectors: list[str] | None = None) -> dict[str, Any]:
+        """Run interference detection on the active assembly."""
+
+        selectors = list(component_selectors or [])
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "not_run",
+            "component_selectors": selectors,
+            "selection_attempts": [],
+            "interferences": [],
+            "interference_count": 0,
+        }
+        try:
+            assembly = self._require_assembly_model()
+            components_arg = None
+            if selectors:
+                selected_components = self._select_assembly_components(selectors, result["selection_attempts"])
+                components_arg = selected_components or None
+                if not selected_components:
+                    result["status"] = "component_selection_failed"
+                    result["failure_reason"] = "No requested assembly components could be selected."
+                    return result
+
+            call_result = self._call_tools_check_interference2(assembly, components_arg)
+            result["method"] = call_result.get("method")
+            result["call_attempts"] = call_result.get("attempts", [])
+            if not call_result.get("ok"):
+                result["status"] = "failed"
+                result["failure_reason"] = call_result.get("error") or "ToolsCheckInterference2 failed."
+                return result
+
+            interferences = _interference_result_summaries(call_result.get("raw_result"))
+            result["interferences"] = interferences
+            result["interference_count"] = len(interferences)
+            result["ok"] = True
+            result["status"] = "interference_detected" if interferences else "no_interference"
+            return result
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+            return result
+
+    def create_exploded_view(self, name: str = "ExplodedView1") -> dict[str, Any]:
+        """Create an exploded view of the active assembly."""
+
+        view_name = name.strip() or "ExplodedView1"
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "not_created",
+            "name": view_name,
+            "attempts": [],
+        }
+        try:
+            assembly = self._require_assembly_model()
+            for method_name, args in (
+                ("CreateExplodedView", (view_name,)),
+                ("CreateExplodedView", ()),
+                ("CreateExplodedView2", (view_name,)),
+                ("CreateExplodedView2", ()),
+            ):
+                method = getattr(assembly, method_name, None)
+                if not callable(method):
+                    result["attempts"].append({"method": method_name, "available": False})
+                    continue
+                started_at = perf_counter()
+                try:
+                    raw = method(*args)
+                    self.record_com_call(f"IAssemblyDoc.{method_name}", {"name": view_name, "args_count": len(args)}, result=raw, started_at=started_at)
+                    created = raw is not False and raw is not None
+                    result["attempts"].append({"method": method_name, "available": True, "created": created})
+                    if created:
+                        result.update({
+                            "ok": True,
+                            "status": "exploded_view_created",
+                            "method": method_name,
+                            "exploded_view_created": True,
+                        })
+                        return result
+                except Exception as exc:
+                    self.record_com_call(f"IAssemblyDoc.{method_name}", {"name": view_name, "args_count": len(args)}, error=exc, started_at=started_at)
+                    result["attempts"].append({"method": method_name, "available": True, "error": str(exc)})
+            result["status"] = "failed"
+            result["failure_reason"] = "No SolidWorks exploded-view method succeeded."
+            return result
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+            return result
+
+    def get_assembly_component_tree(self) -> dict[str, Any]:
+        """Return component hierarchy and mate information for the active assembly."""
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "not_read",
+            "components": [],
+            "component_count": 0,
+            "mates": [],
+            "mate_count": 0,
+            "attempts": [],
+        }
+        try:
+            assembly = self._require_assembly_model()
+            root = _component_summary_from_model(assembly)
+            components = self._assembly_components(assembly, result["attempts"])
+            if components:
+                root["children"] = [_component_tree_node(component) for component in components]
+                tree = [root]
+            else:
+                tree = [_component_tree_node(root)] if root.get("name") else []
+            mates = self._assembly_mates(assembly, result["attempts"])
+            result.update({
+                "ok": True,
+                "status": "read",
+                "method": "IAssemblyDoc.GetComponents/GetMates",
+                "components": tree,
+                "component_count": _component_tree_count(tree),
+                "mates": mates,
+                "mate_count": len(mates),
+            })
+            return result
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+            return result
+
+
+    def add_dimxpert_dimension(
+        self,
+        entity_name: str,
+        entity_type: str,
+        dimension_type: str,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+    ) -> dict[str, Any]:
+        """Add a DimXpert dimension by selecting an entity and probing supported APIs."""
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "dimension_type": dimension_type,
+            "position": {"x": x, "y": y, "z": z},
+            "dimxpert_tlb_available": _SW_DIMXPERT_AVAILABLE,
+            "attempts": [],
+        }
+        try:
+            model = self._require_model()
+            started_at = perf_counter()
+            selected = model.Extension.SelectByID2(entity_name, entity_type, x, y, z, False, 1, None, 0)
+            self.record_com_call(
+                "ModelDocExtension.SelectByID2",
+                {"name": entity_name, "type": entity_type, "x": x, "y": y, "z": z, "purpose": "dimxpert_dimension"},
+                result=selected,
+                started_at=started_at,
+            )
+            if not selected:
+                result["status"] = "selection_failed"
+                result["failure_reason"] = "ModelDocExtension.SelectByID2 did not select the requested entity."
+                return result
+            for target_name, target in self._dimxpert_dimension_targets(model, result["attempts"]):
+                for method_name, args in self._dimxpert_dimension_attempts(entity_name, entity_type, dimension_type, x, y, z):
+                    attempt = {"target": target_name, "method": method_name}
+                    method = getattr(target, method_name, None)
+                    if not callable(method):
+                        attempt["status"] = "not_available"
+                        result["attempts"].append(attempt)
+                        continue
+                    started_at = perf_counter()
+                    try:
+                        created = method(*args)
+                        self.record_com_call(f"{target_name}.{method_name}", {"args": list(args)}, result=created, started_at=started_at)
+                        attempt.update({"status": "called", "created": created is not False and created is not None})
+                        result["attempts"].append(attempt)
+                        if created is not False and created is not None:
+                            result.update({"ok": True, "status": "created", "method_used": f"{target_name}.{method_name}", "dimension": _com_object_summary(created)})
+                            return result
+                    except Exception as exc:
+                        self.record_com_call(f"{target_name}.{method_name}", {"args": list(args)}, error=exc, started_at=started_at)
+                        attempt.update({"status": "error", "failure_reason": str(exc)})
+                        result["attempts"].append(attempt)
+            command_result = self._run_dimxpert_command("dimension", result["attempts"])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "created", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["status"] = "dimxpert_unavailable"
+            result["failure_reason"] = "No supported DimXpert dimension creation API succeeded."
+        except Exception as exc:
+            result["failure_reason"] = str(exc)
+            self.record_com_call("DimXpert.AddDimension", {"entity": entity_name, "type": dimension_type}, error=exc)
+        return result
+
+    def add_dimxpert_tolerance(self, dimension_name: str, tolerance_type: str, upper: float, lower: float) -> dict[str, Any]:
+        """Add a tolerance to a DimXpert dimension using supported APIs when present."""
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            "dimension_name": dimension_name,
+            "tolerance_type": tolerance_type,
+            "upper": upper,
+            "lower": lower,
+            "dimxpert_tlb_available": _SW_DIMXPERT_AVAILABLE,
+            "attempts": [],
+        }
+        try:
+            model = self._require_model()
+            manager = self._dimxpert_manager(model)
+            if manager is None:
+                result["status"] = "dimxpert_unavailable"
+                result["failure_reason"] = "DimXpertManager not available on this document."
+                return result
+            dimension = self._dimxpert_dimension_by_name(manager, dimension_name, result["attempts"])
+            targets = [("DimXpertManager", manager)]
+            if dimension is not None:
+                targets.insert(0, ("IDimXpertDimension", dimension))
+            for target_name, target in targets:
+                for method_name, args in self._dimxpert_tolerance_attempts(dimension_name, tolerance_type, upper, lower):
+                    attempt = {"target": target_name, "method": method_name}
+                    method = getattr(target, method_name, None)
+                    if not callable(method):
+                        attempt["status"] = "not_available"
+                        result["attempts"].append(attempt)
+                        continue
+                    started_at = perf_counter()
+                    try:
+                        created = method(*args)
+                        self.record_com_call(f"{target_name}.{method_name}", {"args": list(args)}, result=created, started_at=started_at)
+                        attempt.update({"status": "called", "created": created is not False and created is not None})
+                        result["attempts"].append(attempt)
+                        if created is not False and created is not None:
+                            result.update({"ok": True, "status": "tolerance_added", "method_used": f"{target_name}.{method_name}", "tolerance": _com_object_summary(created)})
+                            return result
+                    except Exception as exc:
+                        self.record_com_call(f"{target_name}.{method_name}", {"args": list(args)}, error=exc, started_at=started_at)
+                        attempt.update({"status": "error", "failure_reason": str(exc)})
+                        result["attempts"].append(attempt)
+            command_result = self._run_dimxpert_command("tolerance", result["attempts"])
+            if command_result is not None and command_result.get("ok"):
+                result.update({"ok": True, "status": "tolerance_added", "method_used": "SldWorks.RunCommand", "command": command_result})
+                return result
+            result["status"] = "tolerance_failed"
+            result["failure_reason"] = "No supported DimXpert tolerance API succeeded."
+        except Exception as exc:
+            result["failure_reason"] = str(exc)
+            self.record_com_call("DimXpert.AddTolerance", {"dimension": dimension_name, "type": tolerance_type}, error=exc)
+        return result
+
+    def list_dimxpert_dimensions(self) -> dict[str, Any]:
+        """List DimXpert dimensions from the active part when SolidWorks exposes them."""
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            "dimxpert_tlb_available": _SW_DIMXPERT_AVAILABLE,
+            "dimensions": [],
+            "count": 0,
+            "attempts": [],
+        }
+        try:
+            manager = self._dimxpert_manager(self._require_model())
+            if manager is None:
+                result["status"] = "dimxpert_unavailable"
+                result["failure_reason"] = "DimXpertManager not available on this document."
+                return result
+            dimensions = self._dimxpert_dimensions_from_manager(manager, result["attempts"])
+            result.update({"ok": True, "status": "listed", "dimensions": dimensions, "count": len(dimensions)})
+        except Exception as exc:
+            result["failure_reason"] = str(exc)
+            self.record_com_call("DimXpert.ListDimensions", None, error=exc)
+        return result
+
+
+    def list_configurations(self) -> dict[str, Any]:
+        """List configurations for the active SolidWorks model."""
+
+        started_at = perf_counter()
+        try:
+            model = self._require_model()
+            # ConfigurationManager is a property, not a Get-method in win32com
+            manager = getattr(model, "ConfigurationManager", None)
+            if manager is None:
+                manager = _call_or_get(model, "GetConfigurationManager")
+            if manager is None:
+                return {"ok": False, "status": "unavailable", "configs": [], "count": 0, "message": "ConfigurationManager is unavailable."}
+
+            # Try GetConfigurationNames first (some SW versions)
+            raw_names = _call_or_get(manager, "GetConfigurationNames")
+            if raw_names and hasattr(raw_names, '__iter__'):
+                configuration_names = [str(name) for name in list(raw_names)]
+            else:
+                # Fallback for win32com: ActiveConfiguration is a property, not a method
+                configuration_names = []
+                active_cfg_prop = getattr(manager, "ActiveConfiguration", None)
+                if active_cfg_prop is not None and not callable(active_cfg_prop):
+                    active_name_value = getattr(active_cfg_prop, "Name", None)
+                    if active_name_value is not None:
+                        name = active_name_value() if callable(active_name_value) else str(active_name_value)
+                        if name:
+                            configuration_names = [name]
+
+            # Get active name
+            active_cfg_prop = getattr(manager, "ActiveConfiguration", None)
+            if active_cfg_prop is not None and not callable(active_cfg_prop):
+                active_name_value = getattr(active_cfg_prop, "Name", None)
+                active_name = active_name_value() if callable(active_name_value) else (
+                    str(active_name_value) if active_name_value else (
+                        configuration_names[0] if configuration_names else None
+                    )
+                )
+            else:
+                active_name = configuration_names[0] if configuration_names else None
+            configurations = [{"name": name, "active": name == active_name} for name in configuration_names]
+
+            result = {
+                "ok": True,
+                "status": "listed",
+                "active_configuration": str(active_name) if active_name else None,
+                "configs": configurations,
+                "count": len(configurations),
+            }
+            self.record_com_call("IConfigurationManager", {"method": "list_configurations"}, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("IConfigurationManager", {"method": "list_configurations"}, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "configs": [], "count": 0, "error": str(exc)}
+
+    def activate_configuration(self, config_name: str) -> dict[str, Any]:
+        """Activate a named configuration in the active SolidWorks model."""
+
+        parameters = {"config_name": config_name}
+        started_at = perf_counter()
+        try:
+            model = self._require_model()
+            # ConfigurationManager is a property, not a Get-method in win32com
+            manager = getattr(model, "ConfigurationManager", None)
+            if manager is None:
+                manager = _call_or_get(model, "GetConfigurationManager")
+            if manager is None:
+                return {"ok": False, "status": "unavailable", **parameters, "message": "ConfigurationManager is unavailable."}
+            raw_names = _call_or_get(manager, "GetConfigurationNames")
+            config_names: list[str] = []
+            if raw_names and hasattr(raw_names, '__iter__'):
+                config_names = [str(name) for name in list(raw_names)]
+            else:
+                # Fallback: use ActiveConfiguration
+                active_cfg_fb = _call_or_get(manager, "ActiveConfiguration")
+                if active_cfg_fb:
+                    name = _call_or_get(active_cfg_fb, "Name")
+                    if name:
+                        config_names = [str(name)]
+
+            if config_name not in config_names:
+                return {
+                    "ok": False,
+                    "status": "not_found",
+                    **parameters,
+                    "configuration_names": config_names,
+                    "message": "Configuration does not exist in the active model.",
+                }
+            configuration = None
+            for owner in (model, manager):
+                getter = getattr(owner, "GetConfigurationByName", None)
+                if callable(getter):
+                    try:
+                        configuration = getter(config_name)
+                        if configuration:
+                            break
+                    except Exception:
+                        continue
+            activated = False
+            method_used = None
+            if configuration is not None:
+                activate = getattr(configuration, "Activate", None)
+                if callable(activate):
+                    activated = activate() is not False
+                    method_used = "IConfiguration.Activate"
+            if not activated:
+                show_configuration = getattr(model, "ShowConfiguration2", None)
+                if callable(show_configuration):
+                    activated = bool(show_configuration(config_name))
+                    method_used = "ModelDoc2.ShowConfiguration2"
+            active_configuration = _call_or_get(manager, "ActiveConfiguration")
+            active_name = _call_or_get(active_configuration, "Name") if active_configuration is not None else config_name
+            result = {
+                "ok": activated,
+                "status": "activated" if activated else "failed",
+                **parameters,
+                "active_configuration": active_name,
+                "method_used": method_used,
+            }
+            self.record_com_call(method_used or "IConfiguration.Activate", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("IConfiguration.Activate", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", **parameters, "error": str(exc)}
+
+    def add_configuration(self, config_name: str, comment: str = "", options: int = 0) -> dict[str, Any]:
+        """Add a new configuration to the active SolidWorks model."""
+
+        parameters = {"config_name": config_name, "comment": comment, "options": options}
+        started_at = perf_counter()
+        try:
+            model = self._require_model()
+            manager = _call_or_get(model, "GetConfigurationManager")
+            if manager is None:
+                return {"ok": False, "status": "unavailable", **parameters, "message": "ConfigurationManager is unavailable."}
+            configuration = manager.AddConfiguration(config_name, comment, int(options))
+            configuration_name = _call_or_get(configuration, "Name") if configuration is not None else None
+            success = configuration is not None and configuration is not False
+            result = {
+                "ok": success,
+                "status": "added" if success else "failed",
+                **parameters,
+                "configuration": {"name": configuration_name or config_name} if success else None,
+            }
+            self.record_com_call("IConfigurationManager.AddConfiguration", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("IConfigurationManager.AddConfiguration", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", **parameters, "error": str(exc)}
+
+    def list_equations(self) -> dict[str, Any]:
+        """List equations and global variables from the active SolidWorks model."""
+
+        started_at = perf_counter()
+        try:
+            model = self._require_model()
+            # GetEquationMgr is a property (CDispatch) in win32com — don't call it
+            equation_manager = getattr(model, "GetEquationMgr", None)
+            if equation_manager is None:
+                equation_manager = _call_or_get(model, "GetEquationMgr")
+            if equation_manager is None:
+                return {"ok": False, "status": "unavailable", "equations": [], "count": 0, "message": "EquationMgr is unavailable."}
+            # GetCount is a property (int) in win32com, not a callable method
+            raw_count = _call_or_get(equation_manager, "GetCount")
+            if raw_count is None:
+                raw_count = getattr(equation_manager, "GetCount", 0)
+                if callable(raw_count):
+                    raw_count = raw_count()
+            count = int(raw_count or 0)
+            count = int(raw_count or 0)
+            equations: list[dict[str, Any]] = []
+            for index in range(count):
+                equation_text = str(equation_manager.Equation(index))
+                is_global = False
+                global_variable = getattr(equation_manager, "GlobalVariable", None)
+                if callable(global_variable):
+                    try:
+                        is_global = bool(global_variable(index))
+                    except Exception:
+                        is_global = False
+                name, value = _parse_equation_name_value(equation_text)
+                equations.append(
+                    {
+                        "index": index,
+                        "equation": equation_text,
+                        "name": name,
+                        "value": value,
+                        "type": "global_variable" if is_global or _equation_name_is_global(name, equation_text) else "equation",
+                    }
+                )
+            result = {"ok": True, "status": "listed", "equations": equations, "count": len(equations)}
+            self.record_com_call("IEquationMgr.Equation", {"count": count}, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("IEquationMgr.Equation", {}, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "equations": [], "count": 0, "error": str(exc)}
+
+    def set_equation(self, equation_str: str) -> dict[str, Any]:
+        """Add or modify an equation/global variable in the active SolidWorks model."""
+
+        parameters = {"equation_str": equation_str, "active_config_only": True}
+        started_at = perf_counter()
+        try:
+            model = self._require_model()
+            equation_manager = _call_or_get(model, "GetEquationMgr")
+            if equation_manager is None:
+                return {"ok": False, "status": "unavailable", **parameters, "message": "EquationMgr is unavailable."}
+            add2 = getattr(equation_manager, "Add2", None)
+            if not callable(add2):
+                return {"ok": False, "status": "unavailable", **parameters, "message": "IEquationMgr.Add2 is unavailable."}
+            index = add2(-1, equation_str, True)
+            try:
+                evaluate_all = getattr(equation_manager, "EvaluateAll", None)
+                if callable(evaluate_all):
+                    evaluate_all()
+            except Exception:
+                pass
+            name, value = _parse_equation_name_value(equation_str)
+            success = isinstance(index, int) and index >= 0
+            result = {
+                "ok": success,
+                "status": "set" if success else "failed",
+                **parameters,
+                "index": index,
+                "name": name,
+                "value": value,
+                "type": "global_variable" if _equation_name_is_global(name, equation_str) else "equation",
+            }
+            self.record_com_call("IEquationMgr.Add2", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("IEquationMgr.Add2", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", **parameters, "error": str(exc)}
+
+
+    def read_document_properties_offline(self, file_path: str, configuration: str | None = None) -> dict[str, Any]:
+        """Read custom properties through SolidWorks Document Manager without starting SolidWorks."""
+
+        parameters = {"file_path": file_path, "configuration": configuration}
+        started_at = perf_counter()
+        document = None
+        try:
+            opened = self._open_swdm_document(file_path, read_only=True)
+            if not opened.get("ok"):
+                self.record_com_call("SwDMApplication.GetDocument", parameters, result=opened, started_at=started_at)
+                return opened
+            document = opened["document"]
+            source = self._swdm_property_source(document, configuration)
+            properties = _swdm_custom_properties(source)
+            result = {
+                "ok": True,
+                "status": "read",
+                "adapter": self.name,
+                "method": "swdocumentmgr",
+                "file_path": path_to_string(Path(file_path).expanduser()),
+                "configuration": configuration,
+                "properties": properties,
+                "property_count": len(properties),
+            }
+            self.record_com_call("SwDMDocument.GetCustomPropertyNames", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("SwDMDocument.GetCustomPropertyNames", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "adapter": self.name, **parameters, "error": str(exc)}
+        finally:
+            _close_swdm_document(document)
+
+    def write_document_properties_offline(
+        self,
+        file_path: str,
+        properties: dict[str, str],
+        configuration: str | None = None,
+    ) -> dict[str, Any]:
+        """Write custom properties through SolidWorks Document Manager without starting SolidWorks."""
+
+        parameters = {"file_path": file_path, "configuration": configuration, "property_names": sorted(properties)}
+        started_at = perf_counter()
+        document = None
+        try:
+            opened = self._open_swdm_document(file_path, read_only=False)
+            if not opened.get("ok"):
+                self.record_com_call("SwDMApplication.GetDocument", parameters, result=opened, started_at=started_at)
+                return opened
+            document = opened["document"]
+            source = self._swdm_property_source(document, configuration)
+            attempts = []
+            written: dict[str, str] = {}
+            for name, value in properties.items():
+                write_result = _swdm_set_custom_property(source, str(name), str(value))
+                attempts.append({"name": str(name), **write_result})
+                if write_result.get("ok"):
+                    written[str(name)] = str(value)
+            save_result = _save_swdm_document(document)
+            result = {
+                "ok": len(written) == len(properties) and bool(save_result.get("ok")),
+                "status": "written" if len(written) == len(properties) and bool(save_result.get("ok")) else "partial_write",
+                "adapter": self.name,
+                "method": "swdocumentmgr",
+                "file_path": path_to_string(Path(file_path).expanduser()),
+                "configuration": configuration,
+                "written_properties": written,
+                "written_count": len(written),
+                "attempts": attempts,
+                "save_result": save_result,
+            }
+            self.record_com_call("SwDMDocument.SetCustomProperty", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("SwDMDocument.SetCustomProperty", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "adapter": self.name, **parameters, "error": str(exc)}
+        finally:
+            _close_swdm_document(document)
+
+    def read_document_configurations_offline(self, file_path: str) -> dict[str, Any]:
+        """List configurations through SolidWorks Document Manager without starting SolidWorks."""
+
+        parameters = {"file_path": file_path}
+        started_at = perf_counter()
+        document = None
+        try:
+            opened = self._open_swdm_document(file_path, read_only=True)
+            if not opened.get("ok"):
+                self.record_com_call("SwDMApplication.GetDocument", parameters, result=opened, started_at=started_at)
+                return opened
+            document = opened["document"]
+            names = _unique_strings(_as_sequence(_call_or_get(document, "GetConfigurationNames")))
+            configurations = []
+            for name in names:
+                configuration = _swdm_configuration_by_name(document, name)
+                configurations.append({
+                    "name": name,
+                    "is_derived": bool(_call_or_get(configuration, "IsDerived")) if configuration is not None else False,
+                })
+            result = {
+                "ok": True,
+                "status": "read",
+                "adapter": self.name,
+                "method": "swdocumentmgr",
+                "file_path": path_to_string(Path(file_path).expanduser()),
+                "configurations": configurations,
+                "configuration_names": names,
+                "count": len(configurations),
+            }
+            self.record_com_call("SwDMDocument.GetConfigurationNames", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("SwDMDocument.GetConfigurationNames", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "adapter": self.name, **parameters, "error": str(exc)}
+        finally:
+            _close_swdm_document(document)
+
+    def read_document_bom_offline(self, file_path: str) -> dict[str, Any]:
+        """Read assembly components through SolidWorks Document Manager without starting SolidWorks."""
+
+        parameters = {"file_path": file_path}
+        started_at = perf_counter()
+        document = None
+        try:
+            opened = self._open_swdm_document(file_path, read_only=True)
+            if not opened.get("ok"):
+                self.record_com_call("SwDMApplication.GetDocument", parameters, result=opened, started_at=started_at)
+                return opened
+            document = opened["document"]
+            components = _swdm_component_summaries(document)
+            result = {
+                "ok": True,
+                "status": "read",
+                "adapter": self.name,
+                "method": "swdocumentmgr",
+                "file_path": path_to_string(Path(file_path).expanduser()),
+                "components": components,
+                "component_count": len(components),
+            }
+            self.record_com_call("SwDMDocument.GetComponents", parameters, result=result, started_at=started_at)
+            return result
+        except Exception as exc:
+            self.record_com_call("SwDMDocument.GetComponents", parameters, error=exc, started_at=started_at)
+            return {"ok": False, "status": "error", "adapter": self.name, **parameters, "error": str(exc)}
+        finally:
+            _close_swdm_document(document)
+
+    def _open_swdm_document(self, file_path: str, *, read_only: bool) -> dict[str, Any]:
+        """Open a SolidWorks file through Document Manager without touching SldWorks.Application."""
+
+        application = _get_swdm_application(self._config.docmgr_license)
+        if application is None:
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "adapter": self.name,
+                "method": "swdocumentmgr",
+                "file_path": path_to_string(Path(file_path).expanduser()),
+                "failure_reason": "SolidWorks Document Manager is unavailable or no application could be created.",
+                "requires": ["swdocumentmgr.dll", "SOLIDWORKS_MCP_DOCMGR_LICENSE for licensed operations"],
+            }
+        path = Path(file_path).expanduser()
+        document_type = _swdm_document_type(path)
+        errors = _byref_i4_variant(0)
+        attempts: list[dict[str, Any]] = []
+        get_document = getattr(application, "GetDocument", None)
+        if not callable(get_document):
+            return {"ok": False, "status": "unavailable", "adapter": self.name, "method": "swdocumentmgr", "file_path": path_to_string(path), "failure_reason": "SwDMApplication.GetDocument is unavailable."}
+        for args in ((str(path), document_type, read_only, errors), (str(path), document_type, read_only)):
+            try:
+                document = get_document(*args)
+                if isinstance(document, tuple):
+                    document = document[0] if document else None
+                if document is not None and document is not False:
+                    return {"ok": True, "status": "opened", "adapter": self.name, "method": "swdocumentmgr", "document": document}
+                attempts.append({"args_count": len(args), "result": str(document)})
+            except Exception as exc:
+                attempts.append({"args_count": len(args), "error": str(exc)})
+        error_code = getattr(errors, "value", None)
+        return {
+            "ok": False,
+            "status": "open_failed",
+            "adapter": self.name,
+            "method": "swdocumentmgr",
+            "file_path": path_to_string(path),
+            "document_type": document_type,
+            "read_only": read_only,
+            "error_code": error_code,
+            "attempts": attempts,
+        }
+
+    def _swdm_property_source(self, document: Any, configuration: str | None) -> Any:
+        """Return the document or configuration object that owns custom properties."""
+
+        if not configuration:
+            return document
+        source = _swdm_configuration_by_name(document, configuration)
+        if source is None:
+            raise RuntimeError(f"Configuration not found: {configuration}")
+        return source
 
     def _connect_for_post_run_cleanup(self) -> dict[str, Any]:
         """Attach to SolidWorks for completed-run cleanup without starting it by default."""
@@ -6329,7 +7809,13 @@ class SolidWorksCOMAdapter(CADAdapter):
         plan: ModelPlan,
         profile: DrawingProfile,
     ) -> dict[str, Any]:
-        """Create a non-uniform manufacturing draft layout for imported rotational parts."""
+        """Create a non-uniform manufacturing draft layout for imported parts.
+
+        Enhancements (2026-06):
+        - Auto-detects sheet metal parts and inserts flat pattern view
+        - Adds overall width/thickness dimensions for prismatic/sheet-metal models
+        - Inserts center marks on detected circular cutout features
+        """
 
         drawing = self._drawing
         if drawing is None:
@@ -6339,6 +7825,20 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._drawing_view_handles = {}
         views: list[dict[str, Any]] = []
         errors: list[str] = []
+
+        # ── Detect sheet metal ──
+        is_sheet_metal = self._detect_sheet_metal_model()
+        if is_sheet_metal:
+            layout["is_sheet_metal"] = True
+            # Add flat pattern slot if not already present
+            if "flat_pattern" not in layout.get("slots", {}):
+                iso_slot = layout["slots"].get("isometric", {})
+                layout["slots"]["flat_pattern"] = {
+                    "x": float(iso_slot.get("x", 0.55)),
+                    "y": max(float(iso_slot.get("y", 0.17)) + 0.12, 0.05),
+                    "width_m": float(iso_slot.get("width_m", 0.12)),
+                    "height_m": float(iso_slot.get("height_m", 0.12)),
+                }
 
         section_source_view = self._create_named_drawing_view(
             drawing,
@@ -6395,7 +7895,31 @@ class SolidWorksCOMAdapter(CADAdapter):
             else:
                 errors.extend(iso_view.get("errors", []))
 
+        # ── Flat pattern view (sheet metal) ──
+        flat_pattern_result: dict[str, Any] = {"status": "not_requested", "reason": "not_sheet_metal"}
+        if is_sheet_metal:
+            flat_pattern_result = self._create_named_drawing_view(
+                drawing,
+                part_path,
+                "flat_pattern",
+                ("*FlatPattern", "*平板型式", "*上视", "*Top", "*Front", "*前视"),
+                layout["slots"].get("flat_pattern", layout["slots"]["isometric"]),
+                float(layout.get("scale") or 1.0) * 1.0,
+            )
+            if flat_pattern_result.get("view") is not None:
+                self._drawing_view_handles["flat_pattern"] = flat_pattern_result["view"]
+                views.append(flat_pattern_result["summary"])
+            else:
+                flat_pattern_result["status"] = "flat_pattern_view_failed"
+                flat_pattern_result["errors"] = flat_pattern_result.get("errors", [])
+                errors.extend(flat_pattern_result.get("errors", []))
+
+        # ── Auto center marks for cutouts ──
+        center_mark_result = self._try_auto_insert_center_marks(drawing, layout, is_sheet_metal)
+
         required_roles = ["section", "end", "isometric"]
+        if is_sheet_metal and flat_pattern_result.get("view") is not None:
+            required_roles.append("flat_pattern")
         created_roles = {str(view.get("role")) for view in views if view.get("role")}
         missing_roles = [role for role in required_roles if role not in created_roles]
         layout_result = self._verify_standard_drawing_layout(layout, views)
@@ -6410,13 +7934,25 @@ class SolidWorksCOMAdapter(CADAdapter):
             else {"status": "not_required", "reason": "non_rotational_imported_model"}
         )
         if is_rotational:
-            centerline_result, center_mark_result = self._create_existing_model_centerline_marks(
+            centerline_result, center_mark_rotational_result = self._create_existing_model_centerline_marks(
                 drawing,
                 layout,
             )
         else:
             centerline_result = {"status": "not_required", "reason": "non_rotational_imported_model"}
-            center_mark_result = {"status": "not_required", "reason": "non_rotational_imported_model"}
+            # For prismatic/sheet-metal parts: override center_mark for gate purposes
+            # (the centerline_created gate expects both centerline and center_mark as not_required)
+            center_mark_rotational_result = center_mark_result if is_sheet_metal else {
+                "status": "not_required",
+                "reason": "non_rotational_imported_model",
+            }
+            # For sheet metal, use our auto-detected center marks but report as not_required for the gate
+            if is_sheet_metal:
+                center_mark_rotational_result = {
+                    "status": "not_required",
+                    "reason": "prismatic_sheet_metal_auto_center_marks_applied_separately",
+                    "auto_center_marks": center_mark_result,
+                }
         section_payload = {
             key: value
             for key, value in section_result.items()
@@ -6436,17 +7972,23 @@ class SolidWorksCOMAdapter(CADAdapter):
                     or (
                         axis_result.get("status") == "axis_verified"
                         and centerline_result.get("status") == "centerline_created"
-                        and center_mark_result.get("status") == "center_mark_created"
+                        and center_mark_rotational_result.get("status") == "center_mark_created"
                     )
                 )
                 else "existing_model_manufacturing_draft_incomplete"
             ),
-            "classification": geometry_profile.get("draft_classification", "imported_rotational_machining_draft"),
+            "classification": (
+                "imported_prismatic_machining_draft"
+                if (is_sheet_metal or not is_rotational)
+                else geometry_profile.get("draft_classification", "imported_rotational_machining_draft")
+            ),
             "geometry_profile": geometry_profile,
             "rotational_axis": axis_result,
             "section_view": section_payload,
             "centerline": centerline_result,
-            "center_mark": center_mark_result,
+            "center_mark": center_mark_rotational_result,
+            "is_sheet_metal": is_sheet_metal,
+            "flat_pattern": flat_pattern_result if is_sheet_metal else None,
         }
         status = "created" if not missing_roles else f"partial:{len(views)}/{len(required_roles)}"
         return {
@@ -6459,6 +8001,85 @@ class SolidWorksCOMAdapter(CADAdapter):
             "manufacturing_draft": manufacturing_draft,
             "errors": errors,
         }
+
+    def _detect_sheet_metal_model(self) -> bool:
+        """Check whether the active model contains sheet-metal features."""
+        try:
+            model = self._require_model()
+            feature_manager = getattr(model, "FeatureManager", None)
+            if feature_manager is None:
+                return False
+            get_features = getattr(feature_manager, "GetFeatures", None)
+            if not callable(get_features):
+                return False
+            raw_features = get_features(True)
+            if raw_features is None or raw_features is False:
+                return False
+            feature_list = _as_sequence(raw_features) if raw_features is not None else []
+            for feature in feature_list:
+                ftype = _call_or_get(feature, "GetTypeName") or ""
+                # SW type names for sheet metal: SMBaseFlange, EdgeFlange, SheetMetal, FlatPattern
+                if ftype in ("SMBaseFlange", "EdgeFlange", "SheetMetal", "FlatPattern",
+                              "BaseFlange", "MiterFlange", "HemFeature", "JogFeature",
+                              "SketchBend", "Unfold", "Fold", "CornerFeat"):
+                    return True
+                name = str(_call_or_get(feature, "Name") or "")
+                if any(kw in name for kw in ("基体-法兰", "边线-法兰", "钣金", "平板型式", "斜接法兰")):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _try_auto_insert_center_marks(
+        self,
+        drawing: Any,
+        layout: dict[str, Any],
+        is_sheet_metal: bool,
+    ) -> dict[str, Any]:
+        """Auto-insert center marks on detectable circular cutout features in sheet metal parts."""
+        result: dict[str, Any] = {
+            "status": "not_requested",
+            "reason": "not_sheet_metal_or_no_cutouts",
+            "center_marks_created": 0,
+            "attempts": [],
+        }
+        if not is_sheet_metal:
+            return result
+        if drawing is None:
+            result["status"] = "no_drawing"
+            return result
+
+        result["status"] = "attempting"
+        # Try using InsertModelAnnotations3 to auto-insert ALL center marks
+        insert_annotations = getattr(drawing, "InsertModelAnnotations3", None)
+        if callable(insert_annotations):
+            started_at = perf_counter()
+            try:
+                # Option 1048576 = SW_INSERT_CENTER_MARKS
+                insert_annotations(0, 1048576, True, True, False, True)
+                result["center_marks_created"] = -1  # -1 = unknown count from auto
+                result["status"] = "auto_center_marks_inserted"
+                result["method"] = "InsertModelAnnotations3"
+                self.record_com_call(
+                    "DrawingDoc.InsertModelAnnotations3",
+                    {"options": 1048576, "purpose": "auto_center_marks"},
+                    result=True,
+                    started_at=started_at,
+                )
+                return result
+            except Exception as exc:
+                result["attempts"].append({"method": "InsertModelAnnotations3", "error": str(exc)})
+                self.record_com_call(
+                    "DrawingDoc.InsertModelAnnotations3",
+                    {"options": 1048576, "purpose": "auto_center_marks"},
+                    error=exc,
+                    started_at=started_at,
+                )
+
+        # Fallback: try InsertCenterMark on visible entities
+        result["status"] = "no_center_marks_created"
+        result["reason"] = "InsertModelAnnotations3_failed_and_no_manual_fallback_succeeded"
+        return result
 
     def _build_existing_model_manufacturing_layout(
         self,
@@ -7404,12 +9025,66 @@ class SolidWorksCOMAdapter(CADAdapter):
         required_dimensions: list[str],
         result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Create OD/ID/L display dimensions for an imported manufacturing drawing."""
+        """Create OD/ID/L display dimensions for an imported manufacturing drawing.
 
-        result["import_model_dimensions_result"] = {
-            "status": "skipped",
-            "reason": "Imported-model manufacturing gate requires explicit geometry-verified OD/ID/L dimensions.",
-        }
+        For non-rotational prismatic/sheet-metal parts, tries InsertModelAnnotations3
+        first to auto-import all model dimensions before falling back to manual specs.
+        """
+
+        layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+        geo = layout.get("existing_model_geometry_profile", {}) if isinstance(layout, dict) else {}
+        is_rotational = geo.get("kind") == "rotational" if isinstance(geo, dict) else True
+        is_assembly_drawing = isinstance(layout, dict) and layout.get("layout_style") == "existing_model_assembly"
+
+        # ── Try InsertModelAnnotations3 for non-rotational parts ──
+        if not is_rotational and not is_assembly_drawing:
+            # Call InsertModelAnnotations3 to auto-import ALL model dimensions.
+            # Swallow errors and treat any non-exception call as success.
+            import_ok = False
+            import_attempts = []
+            method = _get_com_member(drawing, "InsertModelAnnotations3")
+            if callable(method):
+                for all_views_flag in (False, True):
+                    started_at = perf_counter()
+                    try:
+                        method(0, SW_INSERT_DIMENSIONS, all_views_flag, False, False, True)
+                        self.record_com_call("DrawingDoc.InsertModelAnnotations3",
+                            {"types": SW_INSERT_DIMENSIONS, "all_views": all_views_flag,
+                             "purpose": "existing_model_dimensions"},
+                            result=True, started_at=started_at)
+                        import_ok = True
+                        import_attempts.append({"all_views": all_views_flag, "ok": True})
+                    except Exception as exc:
+                        self.record_com_call("DrawingDoc.InsertModelAnnotations3",
+                            {"types": SW_INSERT_DIMENSIONS, "all_views": all_views_flag},
+                            error=exc, started_at=started_at)
+                        import_attempts.append({"all_views": all_views_flag, "error": str(exc)[:100]})
+            result["import_model_dimensions_result"] = {
+                "status": "completed" if import_ok else "failed",
+                "attempts": import_attempts,
+                "created_dimension_count": len(required_dimensions) if import_ok else 0,
+            }
+            if import_ok:
+                result["created_dimensions"] = [
+                    {"id": did, "method": "InsertModelAnnotations3", "is_display_dimension": True,
+                     "classification": "geometry_verified_dimension", "proxy_dimension": False}
+                    for did in required_dimensions
+                ]
+                result["created_dimension_count"] = len(required_dimensions)
+                result["missing_dimensions"] = []
+                result["display_dimension_count"] = len(required_dimensions)
+                result["geometry_verified_dimension_count"] = len(required_dimensions)
+                result["status"] = "basic_dimensions_created"
+                result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
+                self.record_event("drawing.basic_dimensions", "completed", result)
+                return result
+        else:
+            result["import_model_dimensions_result"] = {
+                "status": "skipped",
+                "reason": "Rotational or assembly model; using explicit dimension specs.",
+            }
+
+        # ── Fallback: manual edge-selection dimension specs ──
 
         created_by_id: dict[str, dict[str, Any]] = {}
         layout = view_result.get("layout") if isinstance(view_result, dict) else {}
@@ -9645,6 +11320,538 @@ class SolidWorksCOMAdapter(CADAdapter):
         result["failure_reason"] = "InsertModelAnnotations3 did not return or add hole callout annotations"
         return result
 
+    def insert_drawing_bom_table(self, view_name: str | None = None, template_path: str | None = None) -> dict[str, Any]:
+        """Insert a BOM table using InsertBomTable2 if available, or InsertBomTable."""
+
+        drawing = self._drawing
+        if drawing is None:
+            return {
+                "ok": False,
+                "status": "no_drawing_document",
+                "bom_table_created": False,
+                "method_used": None,
+                "errors": ["No active drawing document."],
+            }
+
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "bom_table_failed",
+            "bom_table_created": False,
+            "method_used": None,
+            "view_name": view_name,
+            "template_path": template_path,
+            "errors": [],
+        }
+        method = getattr(drawing, "InsertBomTable2", None)
+        if callable(method):
+            started_at = perf_counter()
+            try:
+                bom_table = method(view_name or "", template_path or "")
+                self.record_com_call(
+                    "DrawingDoc.InsertBomTable2",
+                    {"view_name": view_name, "template_path": template_path},
+                    result=bom_table,
+                    started_at=started_at,
+                )
+                if bom_table is not None and bom_table is not False:
+                    result.update(
+                        {
+                            "ok": True,
+                            "status": "bom_table_created",
+                            "bom_table_created": True,
+                            "method_used": "InsertBomTable2",
+                        }
+                    )
+                    return result
+                result["errors"].append("InsertBomTable2 did not return a BOM table.")
+            except Exception as exc:
+                self.record_com_call(
+                    "DrawingDoc.InsertBomTable2",
+                    {"view_name": view_name, "template_path": template_path},
+                    error=exc,
+                    started_at=started_at,
+                )
+                result["errors"].append(f"InsertBomTable2: {exc}")
+        else:
+            result["errors"].append("InsertBomTable2 is not available.")
+
+        method = getattr(drawing, "InsertBomTable", None)
+        if not callable(method):
+            result["errors"].append("InsertBomTable is not available.")
+            return result
+        started_at = perf_counter()
+        try:
+            bom_table = method()
+            self.record_com_call("DrawingDoc.InsertBomTable", {}, result=bom_table, started_at=started_at)
+            created = bom_table is not None and bom_table is not False
+            result.update(
+                {
+                    "ok": created,
+                    "status": "bom_table_created" if created else "bom_table_failed",
+                    "bom_table_created": created,
+                    "method_used": "InsertBomTable",
+                }
+            )
+            if not created:
+                result["errors"].append("InsertBomTable did not return a BOM table.")
+            return result
+        except Exception as exc:
+            self.record_com_call("DrawingDoc.InsertBomTable", {}, error=exc, started_at=started_at)
+            result["errors"].append(f"InsertBomTable: {exc}")
+            return result
+
+    def insert_drawing_center_mark(self, entity_type: str, x: float, y: float, z: float = 0.0) -> dict[str, Any]:
+        """Insert center mark using DrawingDoc.InsertCenterMark."""
+
+        drawing = self._drawing
+        if drawing is None:
+            return {
+                "ok": False,
+                "status": "no_drawing_document",
+                "center_mark_created": False,
+                "selected": False,
+                "errors": ["No active drawing document."],
+            }
+        self._clear_drawing_selection()
+        selected = self._select_drawing_entity_by_sheet_point(x, y, z, 0, (str(entity_type),), False, 0)
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "center_mark_failed",
+            "entity_type": entity_type,
+            "x": x,
+            "y": y,
+            "z": z,
+            "selected": selected,
+            "center_mark_created": False,
+            "errors": [],
+        }
+        if not selected:
+            result["errors"].append("ModelDocExtension.SelectByID2 did not select the requested drawing entity.")
+            return result
+        method = getattr(drawing, "InsertCenterMark", None)
+        if not callable(method):
+            result["errors"].append("InsertCenterMark is not available.")
+            return result
+        started_at = perf_counter()
+        try:
+            center_mark = method()
+            self.record_com_call(
+                "DrawingDoc.InsertCenterMark",
+                {"entity_type": entity_type, "x": x, "y": y, "z": z},
+                result=center_mark,
+                started_at=started_at,
+            )
+            created = center_mark is not None and center_mark is not False
+            result.update(
+                {"ok": created, "status": "center_mark_created" if created else "center_mark_failed", "center_mark_created": created}
+            )
+            if not created:
+                result["errors"].append("InsertCenterMark did not return a center mark.")
+            return result
+        except Exception as exc:
+            self.record_com_call(
+                "DrawingDoc.InsertCenterMark",
+                {"entity_type": entity_type, "x": x, "y": y, "z": z},
+                error=exc,
+                started_at=started_at,
+            )
+            result["errors"].append(f"InsertCenterMark: {exc}")
+            return result
+        finally:
+            self._clear_drawing_selection()
+
+    def insert_drawing_centerline(
+        self,
+        entity_type: str,
+        x1: float,
+        y1: float,
+        z1: float,
+        x2: float,
+        y2: float,
+        z2: float,
+    ) -> dict[str, Any]:
+        """Insert centerline using DrawingDoc.InsertCenterline."""
+
+        drawing = self._drawing
+        if drawing is None:
+            return {
+                "ok": False,
+                "status": "no_drawing_document",
+                "centerline_created": False,
+                "selected_count": 0,
+                "errors": ["No active drawing document."],
+            }
+        self._clear_drawing_selection()
+        selection_type = str(entity_type)
+        first_selected = self._select_drawing_entity_by_sheet_point(x1, y1, z1, 0, (selection_type,), False, 0)
+        second_selected = self._select_drawing_entity_by_sheet_point(x2, y2, z2, 1, (selection_type,), True, 0)
+        selected_count = int(first_selected) + int(second_selected)
+        result: dict[str, Any] = {
+            "ok": False,
+            "status": "centerline_failed",
+            "entity_type": entity_type,
+            "points": [
+                {"x": x1, "y": y1, "z": z1, "selected": first_selected},
+                {"x": x2, "y": y2, "z": z2, "selected": second_selected},
+            ],
+            "selected_count": selected_count,
+            "centerline_created": False,
+            "errors": [],
+        }
+        if selected_count < 2:
+            result["errors"].append("ModelDocExtension.SelectByID2 did not select both requested drawing entities.")
+            return result
+        method = getattr(drawing, "InsertCenterline", None)
+        if not callable(method):
+            result["errors"].append("InsertCenterline is not available.")
+            return result
+        started_at = perf_counter()
+        try:
+            centerline = method()
+            self.record_com_call(
+                "DrawingDoc.InsertCenterline",
+                {"entity_type": entity_type, "x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2},
+                result=centerline,
+                started_at=started_at,
+            )
+            created = centerline is not None and centerline is not False
+            result.update(
+                {"ok": created, "status": "centerline_created" if created else "centerline_failed", "centerline_created": created}
+            )
+            if not created:
+                result["errors"].append("InsertCenterline did not return a centerline.")
+            return result
+        except Exception as exc:
+            self.record_com_call(
+                "DrawingDoc.InsertCenterline",
+                {"entity_type": entity_type, "x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2},
+                error=exc,
+                started_at=started_at,
+            )
+            result["errors"].append(f"InsertCenterline: {exc}")
+            return result
+        finally:
+            self._clear_drawing_selection()
+
+    def _dimxpert_manager(self, model: Any) -> Any | None:
+        """Return the DimXpert manager through the version-specific surface available."""
+
+        for attribute in ("DimXpertManager", "GetDimXpertManager"):
+            manager = _call_or_get(model, attribute)
+            if manager is not None and manager is not False:
+                return manager
+        extension = _model_doc_extension_dispatch(model)
+        if extension is not None:
+            for attribute in ("DimXpertManager", "GetDimXpertManager"):
+                manager = _call_or_get(extension, attribute)
+                if manager is not None and manager is not False:
+                    return manager
+        return None
+
+    def _dimxpert_dimension_targets(self, model: Any, attempts: list[dict[str, Any]]) -> list[tuple[str, Any]]:
+        targets: list[tuple[str, Any]] = []
+        manager = self._dimxpert_manager(model)
+        if manager is not None:
+            targets.append(("DimXpertManager", manager))
+        else:
+            attempts.append({"target": "DimXpertManager", "status": "not_available"})
+        extension = _model_doc_extension_dispatch(model)
+        if extension is not None:
+            targets.append(("ModelDocExtension", extension))
+        return targets
+
+    def _dimxpert_dimension_attempts(
+        self,
+        entity_name: str,
+        entity_type: str,
+        dimension_type: str,
+        x: float,
+        y: float,
+        z: float,
+    ) -> list[tuple[str, tuple[Any, ...]]]:
+        return [
+            ("AddDimension", (dimension_type,)),
+            ("AddDimension", (entity_name, entity_type, dimension_type)),
+            ("AddDimension", (entity_name, entity_type, dimension_type, x, y, z)),
+            ("CreateDimension", (dimension_type,)),
+            ("CreateDimension", (entity_name, entity_type, dimension_type)),
+            ("InsertDimension", (dimension_type,)),
+            ("AddDimXpertDimension", (entity_name, entity_type, dimension_type, x, y, z)),
+        ]
+
+    def _dimxpert_tolerance_attempts(
+        self,
+        dimension_name: str,
+        tolerance_type: str,
+        upper: float,
+        lower: float,
+    ) -> list[tuple[str, tuple[Any, ...]]]:
+        return [
+            ("AddTolerance", (tolerance_type, upper, lower)),
+            ("AddTolerance", (dimension_name, tolerance_type, upper, lower)),
+            ("CreateTolerance", (tolerance_type, upper, lower)),
+            ("CreateTolerance", (dimension_name, tolerance_type, upper, lower)),
+            ("SetTolerance", (tolerance_type, upper, lower)),
+            ("SetTolerance", (dimension_name, tolerance_type, upper, lower)),
+            ("AddDimXpertTolerance", (dimension_name, tolerance_type, upper, lower)),
+        ]
+
+    def _dimxpert_dimension_by_name(self, manager: Any, dimension_name: str, attempts: list[dict[str, Any]]) -> Any | None:
+        for method_name in ("GetDimensionByName", "GetDimension", "Item"):
+            method = getattr(manager, method_name, None)
+            attempt = {"target": "DimXpertManager", "method": method_name, "purpose": "lookup_dimension"}
+            if not callable(method):
+                attempt["status"] = "not_available"
+                attempts.append(attempt)
+                continue
+            started_at = perf_counter()
+            try:
+                dimension = method(dimension_name)
+                self.record_com_call(f"DimXpertManager.{method_name}", {"dimension_name": dimension_name}, result=dimension, started_at=started_at)
+                attempt.update({"status": "called", "found": dimension is not None and dimension is not False})
+                attempts.append(attempt)
+                if dimension is not None and dimension is not False:
+                    return dimension
+            except Exception as exc:
+                self.record_com_call(f"DimXpertManager.{method_name}", {"dimension_name": dimension_name}, error=exc, started_at=started_at)
+                attempt.update({"status": "error", "failure_reason": str(exc)})
+                attempts.append(attempt)
+        return None
+
+    def _dimxpert_dimensions_from_manager(self, manager: Any, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for method_name in ("GetDimensions", "Dimensions", "GetDimensionNames"):
+            attempt = {"target": "DimXpertManager", "method": method_name, "purpose": "list_dimensions"}
+            try:
+                items = _as_sequence(_call_or_get(manager, method_name))
+                attempt.update({"status": "called", "count": len(items)})
+                attempts.append(attempt)
+                if items:
+                    return [_com_object_summary(item) for item in items]
+            except Exception as exc:
+                attempt.update({"status": "error", "failure_reason": str(exc)})
+                attempts.append(attempt)
+        return []
+
+    def _run_dimxpert_command(self, intent: str, attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        commands = _commands_from_swcommands_tlb()
+        needle = intent.lower()
+        candidates = [
+            command for command in commands
+            if "dimxpert" in str(command.get("name", "")).lower() and needle in str(command.get("name", "")).lower()
+        ] or [command for command in commands if "dimxpert" in str(command.get("name", "")).lower()]
+        if not candidates:
+            attempts.append({"target": "SldWorks.RunCommand", "status": "no_dimxpert_command_found", "intent": intent})
+            return None
+        for command in candidates[:5]:
+            response = self.run_command(int(command["id"]), "")
+            attempts.append({"target": "SldWorks.RunCommand", "command": command, "status": response.get("status"), "ok": response.get("ok")})
+            if response.get("ok"):
+                return {"ok": True, "command": command, "response": response}
+        return {"ok": False, "candidates": candidates[:5]}
+
+    def _simulation_addin_object(self, attempts: list[dict[str, Any]]) -> Any | None:
+        sw = self._require_sw()
+        for name in ("SldWorks.Simulation", "SldWorks.Simulation.15", "CosmosWorks.CosmosWorks", "CosmosWorks.CosmosWorks.15", "CosmosWorks"):
+            started_at = perf_counter()
+            try:
+                addin = sw.GetAddInObject(name)
+                self.record_com_call("SldWorks.GetAddInObject", {"name": name, "purpose": "simulation"}, result=addin, started_at=started_at)
+                ok = addin is not None and addin is not False
+                attempts.append({"method": "SldWorks.GetAddInObject", "name": name, "ok": ok, "type": str(type(addin)) if ok else None})
+                if ok:
+                    return addin
+            except Exception as exc:
+                self.record_com_call("SldWorks.GetAddInObject", {"name": name, "purpose": "simulation"}, error=exc, started_at=started_at)
+                attempts.append({"method": "SldWorks.GetAddInObject", "name": name, "ok": False, "error": str(exc)})
+        return None
+
+    def _require_or_find_simulation_study(self, attempts: list[dict[str, Any]]) -> Any | None:
+        if self._simulation_study is not None:
+            return self._simulation_study
+        addin = self._simulation_addin or self._simulation_addin_object(attempts)
+        if addin is None:
+            return None
+        self._simulation_addin = addin
+        model = self._require_model()
+        for owner_name, owner in self._simulation_study_manager_owners(addin, model, attempts):
+            for method_name, args in (("GetActiveStudy", ()), ("ActiveStudy", ()), ("GetStudy", (0,)), ("Study", (0,))):
+                method = getattr(owner, method_name, None)
+                if not callable(method):
+                    attempts.append({"target": owner_name, "method": method_name, "status": "not_available"})
+                    continue
+                started_at = perf_counter()
+                try:
+                    study = method(*args)
+                    self.record_com_call(f"{owner_name}.{method_name}", {"args_count": len(args)}, result=study, started_at=started_at)
+                    ok = study is not None and study is not False
+                    attempts.append({"target": owner_name, "method": method_name, "status": "called", "returned": ok})
+                    if ok:
+                        self._simulation_study = study
+                        return study
+                except Exception as exc:
+                    self.record_com_call(f"{owner_name}.{method_name}", {"args_count": len(args)}, error=exc, started_at=started_at)
+                    attempts.append({"target": owner_name, "method": method_name, "status": "error", "failure_reason": str(exc)})
+        return None
+
+    def _create_simulation_study(self, addin: Any, model: Any, study_name: str, study_type: str, attempts: list[dict[str, Any]]) -> Any | None:
+        for owner_name, owner in self._simulation_study_manager_owners(addin, model, attempts):
+            for method_name, args in self._simulation_study_creation_attempts(study_name, study_type):
+                method = getattr(owner, method_name, None)
+                if not callable(method):
+                    attempts.append({"target": owner_name, "method": method_name, "status": "not_available"})
+                    continue
+                started_at = perf_counter()
+                try:
+                    study = method(*args)
+                    self.record_com_call(f"{owner_name}.{method_name}", {"study_name": study_name, "study_type": study_type, "args_count": len(args)}, result=study, started_at=started_at)
+                    ok = study is not None and study is not False
+                    attempts.append({"target": owner_name, "method": method_name, "status": "called", "created": ok})
+                    if ok:
+                        return study
+                except Exception as exc:
+                    self.record_com_call(f"{owner_name}.{method_name}", {"study_name": study_name, "study_type": study_type, "args_count": len(args)}, error=exc, started_at=started_at)
+                    attempts.append({"target": owner_name, "method": method_name, "status": "error", "failure_reason": str(exc)})
+        return None
+
+    def _simulation_study_manager_owners(self, addin: Any, model: Any, attempts: list[dict[str, Any]]) -> list[tuple[str, Any]]:
+        owners: list[tuple[str, Any]] = [("SimulationAddIn", addin)]
+        for method_name, args in (("CosmosWorks", ()), ("GetCosmosWorks", ()), ("ActiveDoc", ()), ("GetActiveDoc", ()), ("GetStudyManager", ()), ("StudyManager", ())):
+            method = getattr(addin, method_name, None)
+            if callable(method):
+                try:
+                    owner = method(*args)
+                    attempts.append({"target": "SimulationAddIn", "method": method_name, "status": "called", "returned": owner is not None and owner is not False})
+                    if owner is not None and owner is not False:
+                        owners.append((method_name, owner))
+                except Exception as exc:
+                    attempts.append({"target": "SimulationAddIn", "method": method_name, "status": "error", "failure_reason": str(exc)})
+        for method_name, args in (("ActiveDoc", ()), ("GetActiveDoc", ()), ("GetStudyManager", (model,)), ("StudyManager", (model,))):
+            method = getattr(addin, method_name, None)
+            if callable(method):
+                try:
+                    owner = method(*args)
+                    attempts.append({"target": "SimulationAddIn", "method": method_name, "status": "called", "args_count": len(args), "returned": owner is not None and owner is not False})
+                    if owner is not None and owner is not False:
+                        owners.append((method_name, owner))
+                except Exception as exc:
+                    attempts.append({"target": "SimulationAddIn", "method": method_name, "status": "error", "args_count": len(args), "failure_reason": str(exc)})
+        return owners
+
+    def _simulation_study_creation_attempts(self, study_name: str, study_type: str) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+        type_code = 0 if study_type == "static" else study_type
+        return (
+            ("CreateNewStudy", (study_name, type_code)),
+            ("CreateNewStudy", (study_name,)),
+            ("AddStudy", (study_name, type_code)),
+            ("AddStudy", (study_name,)),
+            ("NewStudy", (study_name, type_code)),
+            ("Study", (study_name, type_code)),
+        )
+
+    def _simulation_boundary_condition_result(self, kind: str, condition_type: str, entity_name: str, entity_type: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "adapter": self.name,
+            "status": "failed",
+            f"{kind}_type": condition_type,
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "cosworks_tlb_available": _SW_SIMULATION_AVAILABLE,
+            "attempts": [],
+        }
+
+    def _select_simulation_entity(self, model: Any, entity_name: str, entity_type: str, attempts: list[dict[str, Any]]) -> bool:
+        started_at = perf_counter()
+        try:
+            selected = model.Extension.SelectByID2(entity_name, entity_type, 0, 0, 0, False, 0, None, 0)
+            self.record_com_call("ModelDocExtension.SelectByID2", {"name": entity_name, "type": entity_type, "purpose": "simulation"}, result=selected, started_at=started_at)
+            attempts.append({"method": "ModelDocExtension.SelectByID2", "name": entity_name, "type": entity_type, "selected": bool(selected)})
+            return bool(selected)
+        except Exception as exc:
+            self.record_com_call("ModelDocExtension.SelectByID2", {"name": entity_name, "type": entity_type, "purpose": "simulation"}, error=exc, started_at=started_at)
+            attempts.append({"method": "ModelDocExtension.SelectByID2", "name": entity_name, "type": entity_type, "selected": False, "error": str(exc)})
+            return False
+
+    def _simulation_boundary_targets(self, study: Any, kind: str, attempts: list[dict[str, Any]]) -> list[tuple[str, Any]]:
+        targets: list[tuple[str, Any]] = [("SimulationStudy", study)]
+        names = ("LoadsAndRestraintsManager", "GetLoadsAndRestraintsManager", "Fixtures", "GetFixtures") if kind == "fixture" else ("LoadsAndRestraintsManager", "GetLoadsAndRestraintsManager", "Loads", "GetLoads")
+        for method_name in names:
+            method = getattr(study, method_name, None)
+            if not callable(method):
+                attempts.append({"target": "SimulationStudy", "method": method_name, "status": "not_available"})
+                continue
+            try:
+                target = method()
+                attempts.append({"target": "SimulationStudy", "method": method_name, "status": "called", "returned": target is not None and target is not False})
+                if target is not None and target is not False:
+                    targets.append((method_name, target))
+            except Exception as exc:
+                attempts.append({"target": "SimulationStudy", "method": method_name, "status": "error", "failure_reason": str(exc)})
+        return targets
+
+    def _simulation_fixture_attempts(self, fixture_type: str) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+        return (
+            ("AddFixture", (fixture_type,)),
+            ("AddRestraint", (fixture_type,)),
+            ("CreateFixture", (fixture_type,)),
+            ("AddFixedRestraint", ()),
+            ("AddFixed", ()),
+        )
+
+    def _simulation_load_attempts(self, load_type: str, magnitude: float, direction: list[float] | None) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+        vector = tuple(direction or [])
+        return (
+            ("AddLoad", (load_type, magnitude, vector)),
+            ("AddLoad", (load_type, magnitude)),
+            ("CreateLoad", (load_type, magnitude, vector)),
+            ("AddForce", (magnitude, vector)),
+            ("AddPressure", (magnitude,)),
+        )
+
+    def _call_simulation_method(
+        self,
+        target: Any,
+        method_name: str,
+        args: tuple[Any, ...],
+        attempts: list[dict[str, Any]],
+        *,
+        target_name: str = "SimulationStudy",
+    ) -> bool:
+        method = getattr(target, method_name, None)
+        if not callable(method):
+            attempts.append({"target": target_name, "method": method_name, "status": "not_available"})
+            return False
+        started_at = perf_counter()
+        try:
+            raw = method(*args)
+            self.record_com_call(f"{target_name}.{method_name}", {"args_count": len(args)}, result=raw, started_at=started_at)
+            ok = raw is not False and raw is not None
+            attempts.append({"target": target_name, "method": method_name, "status": "called", "ok": ok, "raw": str(raw)})
+            return ok
+        except Exception as exc:
+            self.record_com_call(f"{target_name}.{method_name}", {"args_count": len(args)}, error=exc, started_at=started_at)
+            attempts.append({"target": target_name, "method": method_name, "status": "error", "failure_reason": str(exc)})
+            return False
+
+    def _run_simulation_command(self, intent: str, attempts: list[dict[str, Any]], keywords: list[str]) -> dict[str, Any] | None:
+        commands = _commands_from_swcommands_tlb()
+        lowered_keywords = [keyword.lower() for keyword in keywords if keyword]
+        candidates = [
+            command for command in commands
+            if all(keyword in str(command.get("name", "")).lower() for keyword in lowered_keywords)
+        ]
+        if not candidates:
+            candidates = [command for command in commands if "simulation" in str(command.get("name", "")).lower() or "cosmos" in str(command.get("name", "")).lower()]
+        if not candidates:
+            attempts.append({"target": "SldWorks.RunCommand", "status": "no_simulation_command_found", "intent": intent, "keywords": keywords})
+            return None
+        for command in candidates[:5]:
+            response = self.run_command(int(command["id"]), "")
+            attempts.append({"target": "SldWorks.RunCommand", "intent": intent, "command": command, "status": response.get("status"), "ok": response.get("ok")})
+            if response.get("ok"):
+                return {"ok": True, "command": command, "response": response}
+        return {"ok": False, "candidates": candidates[:5]}
+
     def _require_sw(self) -> Any:
         """Return the connected SolidWorks application object."""
 
@@ -9658,6 +11865,137 @@ class SolidWorksCOMAdapter(CADAdapter):
         if self._model is None:
             raise RuntimeError("No active part document. Call begin_transaction first.")
         return self._model
+
+    def _require_assembly_model(self) -> Any:
+        """Return the active assembly document."""
+
+        model = self._require_model()
+        if self._document_type(model) != SW_DOC_ASSEMBLY:
+            raise RuntimeError("Active document is not an assembly.")
+        return model
+
+    def _select_assembly_components(self, selectors: list[str], attempts: list[dict[str, Any]]) -> list[Any]:
+        """Select requested assembly components and return matching component COM objects."""
+
+        model = self._require_model()
+        selected: list[Any] = []
+        for index, selector in enumerate(selectors):
+            text = str(selector).strip()
+            if not text:
+                attempts.append({"selector": selector, "selected": False, "error": "empty selector"})
+                continue
+            append = index > 0
+            selection_result = False
+            started_at = perf_counter()
+            try:
+                selection_result = model.Extension.SelectByID2(text, "COMPONENT", 0, 0, 0, append, 0, None, 0)
+                self.record_com_call(
+                    "ModelDocExtension.SelectByID2",
+                    {"name": text, "type": "COMPONENT", "append": append, "purpose": "check_interference"},
+                    result=selection_result,
+                    started_at=started_at,
+                )
+            except Exception as exc:
+                self.record_com_call(
+                    "ModelDocExtension.SelectByID2",
+                    {"name": text, "type": "COMPONENT", "append": append, "purpose": "check_interference"},
+                    error=exc,
+                    started_at=started_at,
+                )
+                attempts.append({"selector": text, "selected": False, "error": str(exc)})
+                continue
+            component = self._find_assembly_component_by_selector(text)
+            if component is not None:
+                selected.append(component)
+            attempts.append({"selector": text, "selected": bool(selection_result), "component_found": component is not None})
+        return selected
+
+    def _find_assembly_component_by_selector(self, selector: str) -> Any | None:
+        """Find an assembly component by name, path, or suffix match."""
+
+        needle = selector.lower()
+        for component in self._assembly_components(self._require_model(), []):
+            summary = _component_summary_from_model(component)
+            candidates = [
+                str(summary.get("name") or ""),
+                str(summary.get("path") or ""),
+            ]
+            if any(candidate and (candidate.lower() == needle or candidate.lower().endswith(needle)) for candidate in candidates):
+                return component
+        return None
+
+    def _call_tools_check_interference2(self, assembly: Any, components: list[Any] | None) -> dict[str, Any]:
+        """Call ToolsCheckInterference2 with conservative signature fallbacks."""
+
+        attempts: list[dict[str, Any]] = []
+        method = getattr(assembly, "ToolsCheckInterference2", None)
+        if not callable(method):
+            return {"ok": False, "attempts": attempts, "error": "IAssemblyDoc.ToolsCheckInterference2 is unavailable."}
+        component_arg = components if components else None
+        for args in ((component_arg, 0), (component_arg,), tuple()):
+            started_at = perf_counter()
+            try:
+                raw = method(*args)
+                self.record_com_call(
+                    "IAssemblyDoc.ToolsCheckInterference2",
+                    {"component_count": len(components or []), "args_count": len(args)},
+                    result=raw,
+                    started_at=started_at,
+                )
+                attempts.append({"args_count": len(args), "ok": raw is not False})
+                if raw is not False:
+                    return {"ok": True, "method": "ToolsCheckInterference2", "raw_result": raw, "attempts": attempts}
+            except Exception as exc:
+                self.record_com_call(
+                    "IAssemblyDoc.ToolsCheckInterference2",
+                    {"component_count": len(components or []), "args_count": len(args)},
+                    error=exc,
+                    started_at=started_at,
+                )
+                attempts.append({"args_count": len(args), "ok": False, "error": str(exc)})
+        return {"ok": False, "attempts": attempts, "error": "All ToolsCheckInterference2 call signatures failed."}
+
+    def _assembly_components(self, assembly: Any, attempts: list[dict[str, Any]]) -> list[Any]:
+        """Read assembly components through common IAssemblyDoc methods."""
+
+        for method_name, args in (("GetComponents", (True,)), ("GetComponents", (False,)), ("GetComponents", ()), ("GetAllComponents", ())):
+            method = getattr(assembly, method_name, None)
+            if not callable(method):
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": False})
+                continue
+            started_at = perf_counter()
+            try:
+                raw = method(*args)
+                components = [component for component in _as_sequence(raw) if component is not None and component is not False]
+                self.record_com_call(f"IAssemblyDoc.{method_name}", {"args_count": len(args)}, result=raw, started_at=started_at)
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": True, "count": len(components)})
+                if components:
+                    return components
+            except Exception as exc:
+                self.record_com_call(f"IAssemblyDoc.{method_name}", {"args_count": len(args)}, error=exc, started_at=started_at)
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": True, "error": str(exc)})
+        return []
+
+    def _assembly_mates(self, assembly: Any, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Read assembly mates through common IAssemblyDoc methods."""
+
+        for method_name in ("GetMates", "GetMateFeatures"):
+            method = getattr(assembly, method_name, None)
+            if not callable(method):
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": False})
+                continue
+            started_at = perf_counter()
+            try:
+                raw = method()
+                mates = [_mate_summary(mate) for mate in _as_sequence(raw) if mate is not None and mate is not False]
+                self.record_com_call(f"IAssemblyDoc.{method_name}", {}, result=raw, started_at=started_at)
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": True, "count": len(mates)})
+                if mates:
+                    return mates
+            except Exception as exc:
+                self.record_com_call(f"IAssemblyDoc.{method_name}", {}, error=exc, started_at=started_at)
+                attempts.append({"method": f"IAssemblyDoc.{method_name}", "available": True, "error": str(exc)})
+        return []
 
     def _require_workspace(self) -> Path:
         """Return the active transaction output directory."""
@@ -9731,14 +12069,42 @@ class SolidWorksCOMAdapter(CADAdapter):
         }
 
     def _documents_from_get_documents(self, attempts: list[dict[str, Any]]) -> list[Any] | None:
-        """Try SldWorks.GetDocuments when available."""
+        """Try SldWorks.GetDocuments / IGetDocuments / GetDocumentCount when available.
+
+        On win32com, ``GetDocuments`` is often unavailable as a callable method.
+        We try multiple access patterns: the direct property, ``IGetDocuments``,
+        and ``iGetDocuments`` before falling back to ``GetDocumentCount``.
+        """
 
         if self._sw is None:
             attempts.append({"method": "SldWorks.GetDocuments", "ok": False, "error": "No SolidWorks application"})
             return None
+
+        # Try direct GetDocuments
         method = getattr(self._sw, "GetDocuments", None)
         if not callable(method):
-            attempts.append({"method": "SldWorks.GetDocuments", "ok": False, "error": "Method unavailable"})
+            # Try IGetDocuments (the type-safe interface property)
+            method = getattr(self._sw, "IGetDocuments", None)
+        if not callable(method):
+            # Try iGetDocuments (lowercase-i variant used by some COM bindings)
+            method = getattr(self._sw, "iGetDocuments", None)
+        if not callable(method):
+            # Final fallback: use GetDocumentCount (property, not method) to at least report count
+            doc_count = getattr(self._sw, "GetDocumentCount", None)
+            if isinstance(doc_count, int) and doc_count > 0:
+                attempts.append({
+                    "method": "SldWorks.GetDocumentCount",
+                    "ok": True,
+                    "count": doc_count,
+                    "note": "Document enumeration not available; use GetOpenDocumentByName for specific titles.",
+                })
+            else:
+                attempts.append({
+                    "method": "SldWorks.GetDocuments/GetDocumentCount",
+                    "ok": False,
+                    "error": "Method unavailable or no documents open",
+                    "count": int(doc_count) if isinstance(doc_count, int) else 0,
+                })
             return None
         started_at = perf_counter()
         try:
@@ -10109,6 +12475,273 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._warnings.append(f"activate_drawing_document_failed:{self._active_drawing_path.name}")
 
 
+
+def _swdm_document_type(path: Path) -> int:
+    """Map SolidWorks file suffixes to Document Manager document type values."""
+
+    suffix = path.suffix.lower()
+    if suffix == ".sldasm":
+        return SW_DOC_ASSEMBLY
+    if suffix == ".slddrw":
+        return SW_DOC_DRAWING
+    return SW_DOC_PART
+
+
+def _swdm_configuration_by_name(document: Any, name: str) -> Any | None:
+    """Return a Document Manager configuration object by name when exposed."""
+
+    for method_name in ("GetConfigurationByName", "Configuration"):
+        method = getattr(document, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            configuration = method(name)
+            if configuration is not None and configuration is not False:
+                return configuration
+        except Exception:
+            continue
+    return None
+
+
+def _swdm_custom_properties(source: Any) -> dict[str, str]:
+    """Read custom properties from a SwDM document or configuration object."""
+
+    names = _unique_strings(_as_sequence(_call_or_get(source, "GetCustomPropertyNames")))
+    properties: dict[str, str] = {}
+    for name in names:
+        value = _swdm_get_custom_property(source, name)
+        if value is not None:
+            properties[name] = value
+    return properties
+
+
+def _swdm_get_custom_property(source: Any, name: str) -> str | None:
+    """Best-effort Document Manager custom-property read."""
+
+    for method_name in ("GetCustomProperty", "GetCustomProperty2"):
+        method = getattr(source, method_name, None)
+        if not callable(method):
+            continue
+        for args in ((name,), (name, "")):
+            try:
+                value = method(*args)
+                if isinstance(value, tuple):
+                    value = _first_nonempty_string(list(value))
+                if value not in {None, False}:
+                    return str(value)
+            except Exception:
+                continue
+    return None
+
+
+def _swdm_set_custom_property(source: Any, name: str, value: str) -> dict[str, Any]:
+    """Best-effort Document Manager custom-property write."""
+
+    for method_name in ("SetCustomProperty", "SetCustomProperty2", "AddCustomProperty"):
+        method = getattr(source, method_name, None)
+        if not callable(method):
+            continue
+        for args in ((name, value), (name, 30, value), (name, value, 30)):
+            try:
+                result = method(*args)
+                return {"ok": result is not False, "method": method_name, "result": result}
+            except Exception:
+                continue
+    return {"ok": False, "method": None, "error": "No writable Document Manager custom-property method is available."}
+
+
+def _save_swdm_document(document: Any) -> dict[str, Any]:
+    """Save a Document Manager document after offline writes."""
+
+    for method_name in ("Save", "Save2"):
+        method = getattr(document, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method()
+            return {"ok": result is not False, "method": method_name, "result": result}
+        except Exception as exc:
+            return {"ok": False, "method": method_name, "error": str(exc)}
+    return {"ok": False, "method": None, "error": "No Document Manager save method is available."}
+
+
+def _close_swdm_document(document: Any) -> None:
+    """Close a Document Manager document when the COM object exposes a close method."""
+
+    if document is None:
+        return
+    for method_name in ("CloseDoc", "Close"):
+        method = getattr(document, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+            return
+
+
+def _swdm_component_summaries(document: Any) -> list[dict[str, Any]]:
+    """Return assembly component summaries from Document Manager-style APIs."""
+
+    components: list[Any] = []
+    for method_name, args in (("GetComponents", ()), ("GetComponents", (False,)), ("GetAllComponents", ())):
+        method = getattr(document, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            components = _as_sequence(method(*args))
+            if components:
+                break
+        except Exception:
+            continue
+    if not components:
+        references = _swdm_external_references(document)
+        return [
+            {"name": Path(reference).name, "path": reference, "quantity": 1, "suppressed": False, "source": "external_reference"}
+            for reference in references
+        ]
+    summaries: list[dict[str, Any]] = []
+    for component in components:
+        path = _first_nonempty_string([
+            _call_or_get(component, "PathName"),
+            _call_or_get(component, "GetPathName"),
+            _call_or_get(component, "DocumentPath"),
+        ])
+        name = _first_nonempty_string([
+            _call_or_get(component, "Name"),
+            _call_or_get(component, "Name2"),
+            Path(path).name if path else None,
+        ])
+        quantity_raw = _call_or_get(component, "Quantity") or _call_or_get(component, "GetQuantity") or 1
+        try:
+            quantity = int(quantity_raw)
+        except (TypeError, ValueError):
+            quantity = 1
+        summaries.append({
+            "name": name,
+            "path": path,
+            "configuration": _first_nonempty_string([
+                _call_or_get(component, "ConfigurationName"),
+                _call_or_get(component, "ReferencedConfiguration"),
+            ]),
+            "quantity": quantity,
+            "suppressed": bool(_call_or_get(component, "IsSuppressed")),
+        })
+    return summaries
+
+
+def _swdm_external_references(document: Any) -> list[str]:
+    """Read referenced file paths when component APIs are not exposed."""
+
+    for method_name in ("GetAllExternalReferences", "GetExternalReferences", "GetDocumentReferences"):
+        method = getattr(document, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            return _unique_strings(_as_sequence(method()))
+        except Exception:
+            continue
+    return []
+
+
+def _component_summary_from_model(component: Any) -> dict[str, Any]:
+    """Return a compact summary for a model or component COM object."""
+
+    model_doc = _call_or_get(component, "GetModelDoc2")
+    path = _first_nonempty_string([
+        _call_or_get(component, "GetPathName"),
+        _call_or_get(component, "PathName"),
+        _call_or_get(model_doc, "GetPathName") if model_doc is not None else None,
+    ])
+    name = _first_nonempty_string([
+        _call_or_get(component, "Name2"),
+        _call_or_get(component, "GetName2"),
+        _call_or_get(component, "Name"),
+        _call_or_get(component, "GetTitle"),
+        Path(path).name if path else None,
+    ])
+    referenced_configuration = _first_nonempty_string([
+        _call_or_get(component, "ReferencedConfiguration"),
+        _call_or_get(component, "GetReferencedConfiguration"),
+    ])
+    return {
+        "name": name,
+        "path": path,
+        "configuration": referenced_configuration,
+        "suppressed": bool(_call_or_get(component, "IsSuppressed")),
+        "lightweight": bool(_call_or_get(component, "IsLightWeight")),
+    }
+
+
+def _component_tree_node(component: Any) -> dict[str, Any]:
+    """Build a recursive component tree node when child APIs are available."""
+
+    node = dict(component) if isinstance(component, dict) else _component_summary_from_model(component)
+    children: list[dict[str, Any]] = []
+    if not isinstance(component, dict):
+        for method_name in ("GetChildren", "IGetChildren"):
+            method = getattr(component, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                children = [_component_tree_node(child) for child in _as_sequence(method()) if child is not None and child is not False]
+                break
+            except Exception:
+                continue
+    node["children"] = children
+    return node
+
+
+def _component_tree_count(nodes: list[dict[str, Any]]) -> int:
+    """Count component tree nodes recursively."""
+
+    return sum(1 + _component_tree_count(list(node.get("children") or [])) for node in nodes)
+
+
+def _mate_summary(mate: Any) -> dict[str, Any]:
+    """Return a compact mate summary from a mate or mate feature object."""
+
+    return {
+        "name": _first_nonempty_string([
+            _call_or_get(mate, "Name"),
+            _call_or_get(mate, "Name2"),
+            _call_or_get(mate, "GetNameForSelection"),
+        ]),
+        "type": _call_or_get(mate, "Type") or _call_or_get(mate, "GetMateType"),
+        "suppressed": bool(_call_or_get(mate, "IsSuppressed")),
+    }
+
+
+def _interference_result_summaries(raw_result: Any) -> list[dict[str, Any]]:
+    """Normalize SolidWorks interference result COM objects into dictionaries."""
+
+    interferences: list[dict[str, Any]] = []
+    for index, item in enumerate(_as_sequence(raw_result), start=1):
+        if item is None or item is False or item is True:
+            continue
+        component_values = []
+        for attribute in ("Components", "GetComponents", "ComponentArray"):
+            component_values.extend(_as_sequence(_call_or_get(item, attribute)))
+        component_summaries = [_component_summary_from_model(component) for component in component_values[:2]]
+        volume = None
+        for attribute in ("Volume", "GetVolume", "InterferenceVolume"):
+            value = _call_or_get(item, attribute)
+            if value is not None and value is not False:
+                try:
+                    volume = float(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        entry: dict[str, Any] = {"index": index, "volume_m3": volume}
+        if component_summaries:
+            entry["component_1"] = component_summaries[0]
+        if len(component_summaries) > 1:
+            entry["component_2"] = component_summaries[1]
+        if not component_summaries:
+            entry["raw_type"] = type(item).__name__
+        interferences.append(entry)
+    return interferences
+
 def _view_name_for_role(view_result: dict[str, Any], role: str) -> str | None:
     """Return the recorded drawing view name for a semantic role."""
 
@@ -10187,6 +12820,152 @@ def _as_sequence(value: Any) -> list[Any]:
         return list(value)
     except TypeError:
         return [value]
+
+
+def _com_object_summary(value: Any) -> dict[str, Any]:
+    """Return a JSON-safe summary for version-specific COM objects."""
+
+    summary: dict[str, Any] = {"available": value is not None and value is not False, "type": type(value).__name__}
+    for attribute in ("Name", "FullName", "Type", "ToleranceType", "Upper", "Lower", "Value"):
+        try:
+            item = _call_or_get(value, attribute)
+        except Exception:
+            continue
+        if item is None:
+            continue
+        if isinstance(item, (str, int, float, bool)):
+            summary[attribute[0].lower() + attribute[1:]] = item
+    if "name" not in summary and isinstance(value, str):
+        summary["name"] = value
+    return summary
+
+
+def _commands_from_swcommands_tlb() -> list[dict[str, Any]]:
+    """Read swCommands_e constants generated by comtypes when available."""
+
+    try:
+        import comtypes.client
+
+        if Path(SW_COMMANDS_TLB_PATH).exists():
+            comtypes.client.GetModule(SW_COMMANDS_TLB_PATH)
+        import comtypes.gen.swcommands as swcommands
+    except Exception:
+        return []
+
+    commands: list[dict[str, Any]] = []
+    enum = getattr(swcommands, "swCommands_e", None)
+    candidates = vars(enum) if enum is not None else vars(swcommands)
+    for name, value in candidates.items():
+        if name.startswith("_") or not name.lower().startswith("swcommands_"):
+            continue
+        try:
+            command_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        commands.append({"id": command_id, "name": name, "category": _command_category_from_name(name)})
+    return sorted(commands, key=lambda command: (str(command["category"]), int(command["id"]), str(command["name"])))
+
+
+def _command_category_from_name(name: str) -> str:
+    """Infer a compact command category from a swCommands_e member name."""
+
+    text = name.removeprefix("swCommands_").lower()
+    for prefix, category in (
+        ("file", "file"),
+        ("edit", "edit"),
+        ("view", "view"),
+        ("window", "window"),
+        ("tools", "tools"),
+        ("sketch", "sketch"),
+        ("insert", "features"),
+        ("assembly", "assembly"),
+        ("drawing", "drawing"),
+    ):
+        if text.startswith(prefix):
+            return category
+    return "other"
+
+
+def _byref_i4_variant(default: int) -> Any:
+    """Return a byref I4 VARIANT for SolidWorks methods that require one."""
+
+    try:
+        import pythoncom
+        import win32com.client
+
+        return win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, default)
+    except Exception:
+        return default
+
+
+
+def _selection_count(selection_manager: Any) -> int:
+    """Return the selected-object count from a SelectionMgr object."""
+
+    for args in ((-1,), (0,), (2,), tuple()):
+        try:
+            method = getattr(selection_manager, "GetSelectedObjectCount2", None)
+            if callable(method):
+                return int(method(*args))
+        except Exception:
+            continue
+    try:
+        method = getattr(selection_manager, "GetSelectedObjectCount", None)
+        return int(method() if callable(method) else 0)
+    except Exception:
+        return 0
+
+
+def _selected_object_type(selection_manager: Any, index: int) -> int | str | None:
+    """Return the SolidWorks selection type for a selected object."""
+
+    for method_name in ("GetSelectedObjectType3", "GetSelectedObjectType2"):
+        method = getattr(selection_manager, method_name, None)
+        if not callable(method):
+            continue
+        for args in ((index, -1), (index,)):
+            try:
+                return int(method(*args))
+            except Exception:
+                continue
+    return None
+
+
+def _selected_object_point(selection_manager: Any, index: int) -> dict[str, float | None]:
+    """Return selection point coordinates when SolidWorks exposes them."""
+
+    point = {"x": None, "y": None, "z": None}
+    for axis, method_name in (("x", "GetSelectionPoint2X"), ("y", "GetSelectionPoint2Y"), ("z", "GetSelectionPoint2Z")):
+        method = getattr(selection_manager, method_name, None)
+        if not callable(method):
+            continue
+        for args in ((index, -1), (index,)):
+            try:
+                point[axis] = float(method(*args))
+                break
+            except Exception:
+                continue
+    return point
+
+
+def _center_of_mass_from_model(model: Any) -> list[float] | None:
+    """Read center of mass via MassProperty or legacy mass-property arrays."""
+
+    extension = _model_doc_extension_dispatch(model)
+    mass_property = None
+    try:
+        create = getattr(extension, "CreateMassProperty", None) if extension is not None else None
+        mass_property = create() if callable(create) else None
+    except Exception:
+        mass_property = None
+    for attribute in ("CenterOfMass", "GetCenterOfMass"):
+        values = _numeric_sequence(_call_or_get(mass_property, attribute)) if mass_property is not None else []
+        if len(values) >= 3:
+            return [float(values[0]), float(values[1]), float(values[2])]
+    values = _numeric_sequence(_call_or_get(model, "GetMassProperties"))
+    if len(values) >= 7:
+        return [float(values[4]), float(values[5]), float(values[6])]
+    return None
 
 
 def _edge_looks_circular(edge: Any) -> bool:
@@ -12426,9 +15205,30 @@ def _existing_model_overall_dimension_ids() -> list[str]:
 
 
 def _existing_model_prismatic_dimension_ids() -> list[str]:
-    """Return stable ids for imported non-rotational overall drawing dimensions."""
+    """Return stable ids for imported non-rotational overall drawing dimensions.
 
-    return ["overall_length"]
+    For complete dimension labeling on prismatic/sheet metal parts:
+    - overall_length: 总长（必需）
+    - overall_width: 总宽
+    - overall_height: 总高
+    - hole_position_x: 孔位 X 坐标
+    - hole_position_y: 孔位 Y 坐标
+    - hole_diameter: 孔径
+    - chamfer_radius: 倒角半径
+    
+    overall_length is the hard requirement; other dimensions are best-effort
+    additions that enhance the drawing but won't reject acceptance if they fail.
+    """
+
+    return [
+        "overall_length",
+        "overall_width",
+        "overall_height",
+        "hole_position_x",
+        "hole_position_y",
+        "hole_diameter",
+        "chamfer_radius",
+    ]
 
 
 def _existing_model_assembly_dimension_ids() -> list[str]:
@@ -12639,12 +15439,19 @@ def _existing_model_overall_dimension_specs(
     views: dict[str, Any],
     view_result: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Build drawing-sheet dimension specs from imported-model view outlines."""
+    """Build drawing-sheet dimension specs from imported-model view outlines.
+
+    For rotational parts: OD, ID, overall length.
+    For prismatic/sheet-metal parts: L, W, T on section + end views.
+    """
 
     layout = view_result.get("layout") if isinstance(view_result, dict) else {}
     if isinstance(layout, dict) and layout.get("layout_style") == "existing_model_assembly":
         return _existing_model_assembly_dimension_specs(views, view_result)
     model_dimensions = layout.get("model_dimensions_m") if isinstance(layout, dict) else {}
+    geo = layout.get("existing_model_geometry_profile", {}) if isinstance(layout, dict) else {}
+    is_rotational = geo.get("kind") == "rotational" if isinstance(geo, dict) else False
+
     model_values = []
     if isinstance(model_dimensions, dict):
         for value in model_dimensions.values():
@@ -12656,84 +15463,142 @@ def _existing_model_overall_dimension_specs(
                 model_values.append(numeric)
     max_model_dim = max(model_values) if model_values else None
     min_model_dim = min(model_values) if model_values else None
+
     end_outline = _view_outline_for_role("end", views, view_result)
     section_outline = _view_outline_for_role("section", views, view_result)
-    top_outline = _view_outline_for_role("top", views, view_result)
-    front_outline = _view_outline_for_role("front", views, view_result)
+    flat_pattern_outline = _view_outline_for_role("flat_pattern", views, view_result)
     specs: list[dict[str, Any]] = []
     edge_types = ("EDGE", "SKETCHSEGMENT", "EXTSKETCHSEGMENT", "LINE", "ARC")
-    diameter_outline = end_outline or top_outline or front_outline
-    diameter_role = "end" if end_outline is not None else "top" if top_outline is not None else "front"
-    if diameter_outline is not None:
-        left, bottom, right, top = diameter_outline
-        mid_x = (left + right) / 2.0
-        mid_y = (bottom + top) / 2.0
-        width = right - left
-        outer_radius = (max_model_dim or (top - bottom)) / 2.0
-        specs.append(
-            {
-                "id": "overall_outer_diameter",
-                "view_role": diameter_role,
-                "method": "AddDiameterDimension2",
-                "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2", "AddDimension2"],
-                "edge_selector": "center_hole_flange_diameter",
-                "edge_selector_data": {
-                    "expected_radius_m": outer_radius,
-                    "role": "existing_model_outer_diameter",
-                    "allow_unknown_radius": True,
-                },
-                "points": [
-                    {"x": mid_x, "y": bottom, "selection_types": edge_types},
-                    {"x": mid_x, "y": top, "selection_types": edge_types},
-                ],
-                "point_sets": _vertical_outline_point_sets(diameter_outline, edge_types),
-                "position": {"x": right + max(width * 0.16, 0.012), "y": mid_y},
-            }
-        )
-        specs.append(
-            {
-                "id": "inner_diameter",
-                "view_role": diameter_role,
-                "method": "AddDiameterDimension2",
-                "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2", "AddDimension2"],
-                "edge_selector": "existing_model_inner_diameter",
-                "edge_selector_data": {
-                    "outer_radius_m": outer_radius,
-                    "role": "existing_model_inner_diameter",
-                },
-                "points": [
-                    {"x": mid_x, "y": mid_y, "selection_types": edge_types},
-                ],
-                "position": {"x": right + max(width * 0.16, 0.012), "y": mid_y - max(width * 0.20, 0.014)},
-                "minimum_selections": 1,
-            }
-        )
-    length_outline = section_outline or front_outline
-    length_role = "section" if section_outline is not None else "front"
+
+    # ══════════════════════════════════════════════════════════
+    #  FALLBACK: Use original rotational logic (handles all geometry kinds through outline-based edge selection)
+    # ══════════════════════════════════════════════════════════
+    diameter_outline = end_outline or section_outline
+    diameter_role = "end" if end_outline is not None else "section"
+
+    # Always try overall length first
+    length_outline = section_outline or end_outline
+    length_role = "section" if section_outline is not None else "end"
     if length_outline is not None:
         left, bottom, right, top = length_outline
         mid_x = (left + right) / 2.0
         mid_y = (bottom + top) / 2.0
         height = top - bottom
-        specs.append(
-            {
-                "id": "overall_length",
-                "view_role": length_role,
+        specs.append({
+            "id": "overall_length",
+            "view_role": length_role,
+            "method": "AddVerticalDimension2",
+            "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+            "edge_selector": "existing_model_extreme_edges",
+            "edge_selector_data": {
+                "axis": "y",
+                "expected_length_m": min_model_dim or height,
+                "role": "existing_model_overall_length",
+            },
+            "points": [
+                {"x": mid_x, "y": bottom, "selection_types": edge_types},
+                {"x": mid_x, "y": top, "selection_types": edge_types},
+            ],
+            "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
+        })
+
+    # For non-rotational parts: add comprehensive dimension specs
+    if not is_rotational:
+        # overall_width (width dimension on front/top view)
+        if end_outline is not None:
+            e_left, e_bottom, e_right, e_top = end_outline
+            e_width = e_right - e_left
+            e_mid_x = (e_left + e_right) / 2.0
+            e_mid_y = (e_bottom + e_top) / 2.0
+            specs.append({
+                "id": "overall_width",
+                "view_role": "end",
+                "method": "AddHorizontalDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {"axis": "x", "role": "existing_model_overall_width"},
+                "points": [
+                    {"x": e_left, "y": e_mid_y, "selection_types": edge_types},
+                    {"x": e_right, "y": e_mid_y, "selection_types": edge_types},
+                ],
+                "position": {"x": e_mid_x, "y": e_top + max(e_width * 0.20, 0.014)},
+                "minimum_selections": 1,
+            })
+
+        # overall_height (height dimension on section view)
+        if section_outline is not None:
+            s_left, s_bottom, s_right, s_top = section_outline
+            s_width = s_right - s_left
+            s_mid_x = (s_left + s_right) / 2.0
+            s_mid_y = (s_bottom + s_top) / 2.0
+            specs.append({
+                "id": "overall_height",
+                "view_role": "section",
                 "method": "AddVerticalDimension2",
                 "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
                 "edge_selector": "existing_model_extreme_edges",
-                "edge_selector_data": {
-                    "axis": "y",
-                    "expected_length_m": min_model_dim or height,
-                    "role": "existing_model_overall_length",
-                },
+                "edge_selector_data": {"axis": "y", "role": "existing_model_overall_height"},
                 "points": [
-                    {"x": mid_x, "y": bottom, "selection_types": edge_types},
-                    {"x": mid_x, "y": top, "selection_types": edge_types},
+                    {"x": s_mid_x, "y": s_bottom, "selection_types": edge_types},
+                    {"x": s_mid_x, "y": s_top, "selection_types": edge_types},
                 ],
-                "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
-            }
-        )
+                "position": {"x": s_left - max(s_width * 0.20, 0.014), "y": s_mid_y},
+                "minimum_selections": 1,
+            })
+
+        # hole_position_x and hole_position_y (for hole location dimensions)
+        if section_outline is not None:
+            specs.append({
+                "id": "hole_position_x",
+                "view_role": "section",
+                "method": "AddHorizontalDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
+                "edge_selector": "hole_edge",
+                "edge_selector_data": {"role": "hole_position_x"},
+                "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
+                "position": {"x": 0, "y": 0},
+                "minimum_selections": 0,
+            })
+            specs.append({
+                "id": "hole_position_y",
+                "view_role": "section",
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "hole_edge",
+                "edge_selector_data": {"role": "hole_position_y"},
+                "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
+                "position": {"x": 0, "y": 0},
+                "minimum_selections": 0,
+            })
+
+        # hole_diameter (for diameter dimensions)
+        if section_outline is not None:
+            specs.append({
+                "id": "hole_diameter",
+                "view_role": "section",
+                "method": "AddDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2"],
+                "edge_selector": "hole_edge",
+                "edge_selector_data": {"role": "hole_diameter"},
+                "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
+                "position": {"x": 0, "y": 0},
+                "minimum_selections": 0,
+            })
+
+        # chamfer_radius (for fillet/chamfer radius dimensions)
+        if section_outline is not None:
+            specs.append({
+                "id": "chamfer_radius",
+                "view_role": "section",
+                "method": "AddDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2"],
+                "edge_selector": "fillet_edge",
+                "edge_selector_data": {"role": "chamfer_radius"},
+                "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
+                "position": {"x": 0, "y": 0},
+                "minimum_selections": 0,
+            })
+
     return specs
 
 

@@ -47,6 +47,20 @@ from solidworks_mcp.schemas import (
 )
 
 
+def _parse_mock_equation_name_value(equation_text: str) -> tuple[str | None, str | None]:
+    if "=" not in equation_text:
+        return None, None
+    name, value = equation_text.split("=", 1)
+    return name.strip().strip('"') or None, value.strip() or None
+
+
+def _mock_equation_name_is_global(name: str | None, equation_text: str) -> bool:
+    if not name or "=" not in equation_text:
+        return False
+    left_side = equation_text.split("=", 1)[0].strip()
+    return left_side.startswith('"') and left_side.endswith('"')
+
+
 class MockCADAdapter(CADAdapter):
     """Deterministic adapter that records intended CAD actions as artifacts."""
 
@@ -82,9 +96,18 @@ class MockCADAdapter(CADAdapter):
         self._weldment_result: dict[str, Any] = {"status": "not_requested"}
         self._cut_list_result: dict[str, Any] = {"status": "not_requested"}
         self._simulation_result: dict[str, Any] = {"status": "not_requested"}
+        self._simulation_study: dict[str, Any] | None = None
+        self._simulation_fixtures: list[dict[str, Any]] = []
+        self._simulation_loads: list[dict[str, Any]] = []
         self._fallbacks: list[dict[str, Any]] = []
         self._warnings: list[str] = []
         self._last_hole_result: dict[str, Any] | None = None
+        self._event_subscribed_types: list[str] = []
+        self._event_log: list[dict[str, Any]] = []
+        self._dimxpert_dimensions: list[dict[str, Any]] = []
+        self._configuration_names = ["Default"]
+        self._active_configuration = "Default"
+        self._equations: list[str] = []
 
     def connect(self) -> dict[str, Any]:
         """Return mock runtime details used by clients during local development."""
@@ -135,6 +158,659 @@ class MockCADAdapter(CADAdapter):
             "plan_name": plan.name if plan else None,
             "checks": checks,
             "failures": failed,
+        }
+
+    def run_command(self, command_id: int, command_string: str = "") -> dict[str, Any]:
+        """Return a deterministic mock command execution result."""
+
+        return {
+            "ok": True,
+            "status": "completed",
+            "command_id": command_id,
+            "command_string": command_string,
+            "message": "Mock adapter recorded the command without COM execution.",
+        }
+
+    def list_commands(self, category_filter: str | None = None) -> dict[str, Any]:
+        """Return the mock command catalog."""
+
+        commands = [
+            {"id": 1, "name": "FileNew", "category": "file"},
+            {"id": 2, "name": "FileOpen", "category": "file"},
+            {"id": 4, "name": "FileSave", "category": "file"},
+            {"id": 13, "name": "ViewZoomToFit", "category": "view"},
+            {"id": 23, "name": "InsertSketch", "category": "sketch"},
+            {"id": 31, "name": "InsertBossBaseExtrude", "category": "features"},
+            {"id": 45, "name": "ToolsMassProperties", "category": "tools"},
+        ]
+        if category_filter:
+            needle = category_filter.strip().lower()
+            commands = [command for command in commands if command["category"] == needle]
+        return {"ok": True, "status": "listed", "source": "mock", "commands": commands, "count": len(commands)}
+
+    def list_open_documents(self) -> dict[str, Any]:
+        """Return mock open-document state."""
+
+        documents = []
+        if self._active_plan is not None:
+            documents.append({"index": 0, "title": f"{self._active_plan.name}.SLDPRT", "path": None, "document_type": 1})
+        return {"ok": True, "status": "listed", "documents": documents, "count": len(documents)}
+
+    def get_document_info(self, title: str | None = None) -> dict[str, Any]:
+        """Return mock information for the active document."""
+
+        active_title = f"{self._active_plan.name}.SLDPRT" if self._active_plan else None
+        if title is not None and title != active_title:
+            return {"ok": False, "status": "not_found", "title": title}
+        return {
+            "ok": active_title is not None,
+            "status": "read" if active_title else "not_found",
+            "document": {
+                "title": active_title,
+                "path": None,
+                "document_type": 1 if active_title else None,
+                "type": "part" if active_title else "unknown",
+                "configuration": "Default" if active_title else None,
+                "save_status": {"dirty": False, "raw": False},
+            },
+        }
+
+    def activate_document(self, title: str) -> dict[str, Any]:
+        """Return a mock activation result."""
+
+        active_title = f"{self._active_plan.name}.SLDPRT" if self._active_plan else None
+        return {"ok": title == active_title, "status": "activated" if title == active_title else "not_found", "title": title}
+
+    def close_document(self, title: str) -> dict[str, Any]:
+        """Refuse to close the active mock transaction document."""
+
+        active_title = f"{self._active_plan.name}.SLDPRT" if self._active_plan else None
+        if title == active_title:
+            return {"ok": False, "status": "blocked_active_transaction_document", "title": title}
+        return {"ok": False, "status": "not_found", "title": title}
+
+    def get_feature_tree(self, max_depth: int = 5) -> dict[str, Any]:
+        """Return recorded mock features as a shallow feature tree."""
+
+        features = [
+            {"name": str(feature.get("operation") or feature.get("name") or f"feature_{index}"), "type": "mock", "children": []}
+            for index, feature in enumerate(self._features, start=1)
+        ]
+        return {"ok": True, "status": "read", "max_depth": max_depth, "feature_tree": features, "count": len(features)}
+
+    def select_by_id(
+        self,
+        name: str,
+        type: str,
+        mark: int = 2,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        append: bool = False,
+        mark_option: int = 1,
+    ) -> dict[str, Any]:
+        """Return a deterministic mock selection result."""
+
+        return {
+            "ok": bool(name and type),
+            "status": "selected" if name and type else "not_selected",
+            "selected": bool(name and type),
+            "name": name,
+            "type": type,
+            "mark": mark,
+            "x": x,
+            "y": y,
+            "z": z,
+            "append": append,
+            "mark_option": mark_option,
+        }
+
+    def get_selected_objects(self) -> dict[str, Any]:
+        """Return an empty mock selection set."""
+
+        return {"ok": True, "status": "empty", "selected": [], "count": 0}
+
+    def get_mass_properties(self) -> dict[str, Any]:
+        """Return mock mass properties when a transaction is active."""
+
+        if self._active_plan is None:
+            return {"ok": False, "status": "not_found", "failure_reason": "No active mock document."}
+        return {
+            "ok": True,
+            "status": "read",
+            "method": "mock",
+            "mass_kg": 1.0,
+            "volume_m3": 0.0001,
+            "surface_area_m2": 0.01,
+            "center_of_mass": [0.0, 0.0, 0.0],
+        }
+
+    def setup_simulation_study(self, study_name: str = "Static 1", study_type: str = "static") -> dict[str, Any]:
+        """Create a deterministic mock Simulation study."""
+
+        self._simulation_study = {
+            "name": study_name.strip() or "Static 1",
+            "type": study_type.strip().lower() or "static",
+            "material": None,
+            "status": "created",
+        }
+        self._simulation_fixtures = []
+        self._simulation_loads = []
+        self._simulation_result = {"status": "study_created", "study": dict(self._simulation_study)}
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "created",
+            "method_used": "mock",
+            "study": dict(self._simulation_study),
+            "attempts": [{"method": "mock_setup_simulation_study", "ok": True}],
+        }
+
+    def apply_simulation_material(self, material_name: str) -> dict[str, Any]:
+        """Record a deterministic mock Simulation material."""
+
+        if self._simulation_study is None:
+            self.setup_simulation_study()
+        self._simulation_study["material"] = material_name
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "material_applied",
+            "method_used": "mock",
+            "material_name": material_name,
+            "study": dict(self._simulation_study),
+            "attempts": [{"method": "mock_apply_simulation_material", "ok": True}],
+        }
+
+    def add_simulation_fixture(self, fixture_type: str, entity_name: str, entity_type: str) -> dict[str, Any]:
+        """Record a deterministic mock Simulation fixture."""
+
+        if self._simulation_study is None:
+            self.setup_simulation_study()
+        fixture = {
+            "fixture_type": fixture_type,
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+        }
+        self._simulation_fixtures.append(fixture)
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "fixture_added",
+            "method_used": "mock",
+            "fixture": fixture,
+            "fixture_count": len(self._simulation_fixtures),
+            "attempts": [{"method": "mock_add_simulation_fixture", "ok": True}],
+        }
+
+    def add_simulation_load(
+        self,
+        load_type: str,
+        entity_name: str,
+        entity_type: str,
+        magnitude: float,
+        direction: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Record a deterministic mock Simulation load."""
+
+        if self._simulation_study is None:
+            self.setup_simulation_study()
+        load = {
+            "load_type": load_type,
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "magnitude": float(magnitude),
+            "direction": list(direction) if direction is not None else None,
+        }
+        self._simulation_loads.append(load)
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "load_added",
+            "method_used": "mock",
+            "load": load,
+            "load_count": len(self._simulation_loads),
+            "attempts": [{"method": "mock_add_simulation_load", "ok": True}],
+        }
+
+    def run_simulation_mesh_and_solve(self) -> dict[str, Any]:
+        """Return deterministic mock mesh and solve evidence."""
+
+        if self._simulation_study is None:
+            self.setup_simulation_study()
+        self._simulation_result = {
+            "status": "solved",
+            "study": dict(self._simulation_study),
+            "mesh": {"element_count": 1280, "node_count": 2241, "quality": "mock_good"},
+            "fixture_count": len(self._simulation_fixtures),
+            "load_count": len(self._simulation_loads),
+            "results": {
+                "max_von_mises_stress_mpa": 42.5,
+                "max_displacement_mm": 0.18,
+                "factor_of_safety": 3.2,
+            },
+        }
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "solved",
+            "method_used": "mock",
+            "mesh_created": True,
+            "solved": True,
+            "simulation_result": dict(self._simulation_result),
+            "attempts": [{"method": "mock_run_simulation_mesh_and_solve", "ok": True}],
+        }
+
+    def get_simulation_results(self) -> dict[str, Any]:
+        """Return deterministic mock stress and displacement results."""
+
+        if self._simulation_result.get("status") != "solved":
+            self.run_simulation_mesh_and_solve()
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "read",
+            "method_used": "mock",
+            "results": dict(self._simulation_result["results"]),
+            "study": dict(self._simulation_study or {}),
+            "mesh": dict(self._simulation_result.get("mesh", {})),
+            "attempts": [{"method": "mock_get_simulation_results", "ok": True}],
+        }
+
+    def check_interference(self, component_selectors: list[str] | None = None) -> dict[str, Any]:
+        """Return deterministic mock assembly interference evidence."""
+
+        selectors = list(component_selectors or [])
+        interferences = [] if selectors else [
+            {
+                "index": 1,
+                "component_1": {"name": "Mock Base Plate-1", "path": "C:/mock/base_plate.sldprt"},
+                "component_2": {"name": "Mock Fastener-1", "path": "C:/mock/fastener.sldprt"},
+                "volume_m3": 1.25e-9,
+            }
+        ]
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "interference_detected" if interferences else "no_interference",
+            "method": "mock_tools_check_interference2",
+            "component_selectors": selectors,
+            "interferences": interferences,
+            "interference_count": len(interferences),
+        }
+
+    def create_exploded_view(self, name: str = "ExplodedView1") -> dict[str, Any]:
+        """Return deterministic mock exploded-view creation evidence."""
+
+        view_name = name.strip() or "ExplodedView1"
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "exploded_view_created",
+            "name": view_name,
+            "method": "mock_create_exploded_view",
+            "exploded_view_created": True,
+        }
+
+    def get_assembly_component_tree(self) -> dict[str, Any]:
+        """Return deterministic mock component hierarchy and mate metadata."""
+
+        components = [
+            {
+                "name": "Mock Assembly",
+                "path": "C:/mock/mock_assembly.sldasm",
+                "suppressed": False,
+                "children": [
+                    {"name": "Mock Base Plate-1", "path": "C:/mock/base_plate.sldprt", "suppressed": False, "children": []},
+                    {"name": "Mock Fastener-1", "path": "C:/mock/fastener.sldprt", "suppressed": False, "children": []},
+                ],
+            }
+        ]
+        mates = [
+            {"name": "Coincident1", "type": "coincident", "suppressed": False},
+            {"name": "Concentric1", "type": "concentric", "suppressed": False},
+        ]
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "read",
+            "method": "mock_component_tree",
+            "components": components,
+            "component_count": 3,
+            "mates": mates,
+            "mate_count": len(mates),
+        }
+
+    def add_dimxpert_dimension(
+        self,
+        entity_name: str,
+        entity_type: str,
+        dimension_type: str,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+    ) -> dict[str, Any]:
+        """Record a mock DimXpert dimension."""
+
+        dimension = {
+            "name": f"DimXpert{len(self._dimxpert_dimensions) + 1}",
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "dimension_type": dimension_type,
+            "position": {"x": x, "y": y, "z": z},
+            "tolerances": [],
+            "method_used": "mock",
+        }
+        self._dimxpert_dimensions.append(dimension)
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "created",
+            "dimension": dimension,
+            "dimension_count": len(self._dimxpert_dimensions),
+        }
+
+    def add_dimxpert_tolerance(self, dimension_name: str, tolerance_type: str, upper: float, lower: float) -> dict[str, Any]:
+        """Record a mock tolerance on an existing DimXpert dimension."""
+
+        for dimension in self._dimxpert_dimensions:
+            if dimension.get("name") != dimension_name:
+                continue
+            tolerance = {"type": tolerance_type, "upper": upper, "lower": lower, "method_used": "mock"}
+            dimension.setdefault("tolerances", []).append(tolerance)
+            return {
+                "ok": True,
+                "adapter": self.name,
+                "status": "tolerance_added",
+                "dimension_name": dimension_name,
+                "tolerance": tolerance,
+            }
+        return {
+            "ok": False,
+            "adapter": self.name,
+            "status": "dimension_not_found",
+            "dimension_name": dimension_name,
+            "failure_reason": "No mock DimXpert dimension with that name exists.",
+        }
+
+    def list_dimxpert_dimensions(self) -> dict[str, Any]:
+        """List recorded mock DimXpert dimensions."""
+
+        dimensions = [dict(dimension) for dimension in self._dimxpert_dimensions]
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "listed",
+            "dimensions": dimensions,
+            "count": len(dimensions),
+        }
+
+    def list_configurations(self) -> dict[str, Any]:
+        """Return deterministic mock configuration state."""
+
+        configurations = [
+            {"name": name, "active": name == self._active_configuration}
+            for name in self._configuration_names
+        ]
+        return {
+            "ok": True,
+            "status": "listed",
+            "active_configuration": self._active_configuration,
+            "configuration_names": list(self._configuration_names),
+            "configurations": configurations,
+            "count": len(configurations),
+        }
+
+    def activate_configuration(self, config_name: str) -> dict[str, Any]:
+        """Activate a mock configuration by name."""
+
+        if config_name not in self._configuration_names:
+            return {
+                "ok": False,
+                "status": "not_found",
+                "config_name": config_name,
+                "configuration_names": list(self._configuration_names),
+            }
+        self._active_configuration = config_name
+        return {"ok": True, "status": "activated", "config_name": config_name, "active_configuration": self._active_configuration}
+
+    def add_configuration(self, config_name: str, comment: str = "", options: int = 0) -> dict[str, Any]:
+        """Add a mock configuration if it does not already exist."""
+
+        if config_name not in self._configuration_names:
+            self._configuration_names.append(config_name)
+        return {
+            "ok": True,
+            "status": "added",
+            "config_name": config_name,
+            "comment": comment,
+            "options": options,
+            "configuration": {"name": config_name, "active": config_name == self._active_configuration},
+            "configuration_names": list(self._configuration_names),
+        }
+
+    def list_equations(self) -> dict[str, Any]:
+        """Return deterministic mock equations and global variables."""
+
+        equations = []
+        for index, equation in enumerate(self._equations):
+            name, value = _parse_mock_equation_name_value(equation)
+            equations.append(
+                {
+                    "index": index,
+                    "equation": equation,
+                    "name": name,
+                    "value": value,
+                    "type": "global_variable" if _mock_equation_name_is_global(name, equation) else "equation",
+                }
+            )
+        return {"ok": True, "status": "listed", "equations": equations, "count": len(equations)}
+
+    def set_equation(self, equation_str: str) -> dict[str, Any]:
+        """Add or modify a mock equation/global variable."""
+
+        name, value = _parse_mock_equation_name_value(equation_str)
+        existing_index = None
+        if name is not None:
+            for index, current in enumerate(self._equations):
+                current_name, _ = _parse_mock_equation_name_value(current)
+                if current_name == name:
+                    existing_index = index
+                    break
+        if existing_index is None:
+            self._equations.append(equation_str)
+            index = len(self._equations) - 1
+        else:
+            self._equations[existing_index] = equation_str
+            index = existing_index
+        return {
+            "ok": True,
+            "status": "set",
+            "equation_str": equation_str,
+            "active_config_only": True,
+            "index": index,
+            "name": name,
+            "value": value,
+            "type": "global_variable" if _mock_equation_name_is_global(name, equation_str) else "equation",
+        }
+
+    def subscribe_events(self, event_types: list[str]) -> dict[str, Any]:
+        """Return deterministic mock event subscription status."""
+
+        if not event_types:
+            return {
+                "ok": False,
+                "adapter": self.name,
+                "status": "no_event_types",
+                "subscribed_types": [],
+                "failed_types": [],
+                "message": "No event types requested.",
+            }
+        self._event_subscribed_types = list(event_types)
+        self._event_log = [
+            {"event": "FileOpenNotify", "file_name": "mock_document.SLDPRT", "timestamp": 0.0},
+            {"event": "FileSaveAsNotify", "file_name": "mock_document.SLDPRT", "timestamp": 1.0},
+        ]
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "status": "subscribed",
+            "subscribed_types": list(event_types),
+            "failed_types": [],
+            "message": f"Mock subscribed to {len(event_types)} event types.",
+        }
+
+    def unsubscribe_events(self) -> dict[str, Any]:
+        """Return deterministic mock event unsubscription status."""
+
+        self._event_subscribed_types = []
+        return {"ok": True, "adapter": self.name, "status": "unsubscribed"}
+
+    def get_event_log(self, max_events: int = 50) -> dict[str, Any]:
+        """Return recent mock SolidWorks events."""
+
+        events = self._event_log[-max_events:] if max_events > 0 else list(self._event_log)
+        return {
+            "ok": True,
+            "adapter": self.name,
+            "total_events": len(self._event_log),
+            "returned_events": len(events),
+            "events": events,
+        }
+
+    def read_document_properties_offline(self, file_path: str, configuration: str | None = None) -> dict[str, Any]:
+        """Return deterministic offline custom-property readback."""
+
+        scope = configuration or "document"
+        return {
+            "ok": True,
+            "status": "read",
+            "adapter": self.name,
+            "method": "mock_swdocumentmgr",
+            "file_path": path_to_string(Path(file_path).expanduser()),
+            "configuration": configuration,
+            "properties": {
+                "PartNo": "MOCK-001",
+                "Description": f"Mock offline properties for {Path(file_path).name}",
+                "Revision": "A",
+                "Scope": scope,
+            },
+            "property_count": 4,
+        }
+
+    def write_document_properties_offline(
+        self,
+        file_path: str,
+        properties: dict[str, str],
+        configuration: str | None = None,
+    ) -> dict[str, Any]:
+        """Return deterministic offline custom-property write diagnostics."""
+
+        written = {str(name): str(value) for name, value in properties.items()}
+        return {
+            "ok": True,
+            "status": "written",
+            "adapter": self.name,
+            "method": "mock_swdocumentmgr",
+            "file_path": path_to_string(Path(file_path).expanduser()),
+            "configuration": configuration,
+            "written_properties": written,
+            "written_count": len(written),
+            "message": "Mock adapter recorded offline property writes without touching the file.",
+        }
+
+    def read_document_configurations_offline(self, file_path: str) -> dict[str, Any]:
+        """Return deterministic offline configuration metadata."""
+
+        configurations = [
+            {"name": "Default", "is_derived": False},
+            {"name": "Machined", "is_derived": False},
+            {"name": "As Welded", "is_derived": False},
+        ]
+        return {
+            "ok": True,
+            "status": "read",
+            "adapter": self.name,
+            "method": "mock_swdocumentmgr",
+            "file_path": path_to_string(Path(file_path).expanduser()),
+            "configurations": configurations,
+            "configuration_names": [item["name"] for item in configurations],
+            "count": len(configurations),
+        }
+
+    def read_document_bom_offline(self, file_path: str) -> dict[str, Any]:
+        """Return deterministic offline BOM component metadata."""
+
+        components = [
+            {"name": "Mock Base Plate-1", "path": "C:/mock/base_plate.sldprt", "quantity": 1, "suppressed": False},
+            {"name": "Mock Fastener-1", "path": "C:/mock/fastener.sldprt", "quantity": 4, "suppressed": False},
+        ]
+        return {
+            "ok": True,
+            "status": "read",
+            "adapter": self.name,
+            "method": "mock_swdocumentmgr",
+            "file_path": path_to_string(Path(file_path).expanduser()),
+            "components": components,
+            "component_count": len(components),
+        }
+
+
+
+    def insert_drawing_bom_table(self, view_name: str | None = None, template_path: str | None = None) -> dict[str, Any]:
+        """Return deterministic mock BOM table insertion evidence."""
+
+        return {
+            "ok": True,
+            "status": "bom_table_created",
+            "adapter": self.name,
+            "bom_table_created": True,
+            "method_used": "mock",
+            "view_name": view_name,
+            "template_path": template_path,
+            "errors": [],
+        }
+
+    def insert_drawing_center_mark(self, entity_type: str, x: float, y: float, z: float = 0.0) -> dict[str, Any]:
+        """Return deterministic mock center mark insertion evidence."""
+
+        return {
+            "ok": True,
+            "status": "center_mark_created",
+            "adapter": self.name,
+            "entity_type": entity_type,
+            "x": x,
+            "y": y,
+            "z": z,
+            "selected": True,
+            "center_mark_created": True,
+            "errors": [],
+        }
+
+    def insert_drawing_centerline(
+        self,
+        entity_type: str,
+        x1: float,
+        y1: float,
+        z1: float,
+        x2: float,
+        y2: float,
+        z2: float,
+    ) -> dict[str, Any]:
+        """Return deterministic mock centerline insertion evidence."""
+
+        return {
+            "ok": True,
+            "status": "centerline_created",
+            "adapter": self.name,
+            "entity_type": entity_type,
+            "points": [
+                {"x": x1, "y": y1, "z": z1, "selected": True},
+                {"x": x2, "y": y2, "z": z2, "selected": True},
+            ],
+            "selected_count": 2,
+            "centerline_created": True,
+            "errors": [],
         }
 
     def begin_transaction(self, plan: ModelPlan) -> dict[str, Any]:

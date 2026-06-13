@@ -241,6 +241,327 @@ def cleanup_run_documents(run_dir: str) -> dict[str, Any]:
     return executor.cleanup_run_documents(run_dir)
 
 
+@mcp.tool()
+def sw_subscribe_events(event_types: list[str]) -> dict[str, Any]:
+    """Subscribe to SolidWorks application-level COM events.
+
+    Supported event names include ActiveModelDocChange, FileOpenNotify,
+    FileSaveAsNotify, FileCloseNotify, and RebuildNotify. Subscription is
+    explicit and remains active only while the adapter instance is alive.
+    """
+
+    return executor.adapter.subscribe_events(event_types)
+
+
+@mcp.tool()
+def sw_unsubscribe_events() -> dict[str, Any]:
+    """Unsubscribe from all active SolidWorks COM event listeners."""
+
+    return executor.adapter.unsubscribe_events()
+
+
+@mcp.tool()
+def sw_get_event_log(max_events: int = 50) -> dict[str, Any]:
+    """Return recent SolidWorks application events captured by the adapter."""
+
+    return executor.adapter.get_event_log(max_events)
+
+
+@mcp.tool()
+def sw_run_command(command_id: int, command_string: str = "") -> dict[str, Any]:
+    """Execute a SolidWorks command by its command ID.
+
+    Use sw_list_commands to discover available command IDs.  This is the primary
+    gateway to programmatic SolidWorks operation - every toolbar button and menu
+    item maps to a command ID in swCommands_e.  Sensitive or destructive commands
+    should be reviewed before execution.
+    """
+    return executor.adapter.run_command(command_id, command_string)
+
+
+@mcp.tool()
+def sw_list_commands(category_filter: str | None = None) -> dict[str, Any]:
+    """List available SolidWorks command IDs for use with sw_run_command.
+
+    Returns common SolidWorks commands with their IDs and categories.  Use the
+    optional category_filter to narrow results (e.g. "Sketch", "Features",
+    "Drawing", "Assembly").
+    """
+    return executor.adapter.list_commands(category_filter)
+
+
+@mcp.tool()
+def sw_list_open_documents() -> dict[str, Any]:
+    """List all currently open SolidWorks documents.
+
+    Returns title, path, type (part/assembly/drawing), and configuration for
+    each open document.  Use this before sw_activate_document or
+    sw_close_document.
+    """
+    return executor.adapter.list_open_documents()
+
+
+@mcp.tool()
+def sw_get_document_info(title: str | None = None) -> dict[str, Any]:
+    """Get detailed information about a SolidWorks document.
+
+    If title is omitted, returns info for the currently active document.
+    Includes path, type, configuration, read-only status, and save state.
+    """
+    return executor.adapter.get_document_info(title)
+
+
+@mcp.tool()
+def sw_activate_document(title: str) -> dict[str, Any]:
+    """Switch the active SolidWorks document to the named document.
+
+    The document must already be open.  Use sw_list_open_documents to see
+    available document titles.
+    """
+    return executor.adapter.activate_document(title)
+
+
+@mcp.tool()
+def sw_close_document(title: str) -> dict[str, Any]:
+    """Close a specific SolidWorks document by title.
+
+    The document must be open.  This will NOT close documents that are part
+    of an active modeling transaction.  Use with caution - unsaved changes
+    may be lost.
+    """
+    return executor.adapter.close_document(title)
+
+
+@mcp.tool()
+def sw_get_feature_tree(max_depth: int = 5) -> dict[str, Any]:
+    """Traverse the feature tree of the active SolidWorks model.
+
+    Returns a nested tree of features (extrudes, cuts, fillets, sketches, etc.)
+    with their types and child features.  Use max_depth to limit traversal depth.
+    """
+    return executor.adapter.get_feature_tree(max_depth)
+
+
+@mcp.tool()
+def sw_select_by_id(
+    name: str,
+    type: str,
+    mark: int = 2,
+    x: float = 0,
+    y: float = 0,
+    z: float = 0,
+    append: bool = False,
+    mark_option: int = 1,
+) -> dict[str, Any]:
+    """Select a SolidWorks entity by its identifier string.
+
+    This is the primary selection mechanism.  Common type values: "FACE",
+    "EDGE", "VERTEX", "PLANE", "SKETCH", "BODY".  The name format
+    depends on the entity type (e.g. face names from feature tree).
+    Set append=True to add to existing selection instead of replacing it.
+    """
+    return executor.adapter.select_by_id(name, type, mark, x, y, z, append, mark_option)
+
+
+@mcp.tool()
+def sw_get_selected_objects() -> dict[str, Any]:
+    """Get the currently selected objects in SolidWorks.
+
+    Returns a list of selected entities with their types, names, and
+    selection coordinates.  Useful for inspecting what the user has selected
+    or verifying that a sw_select_by_id call succeeded.
+    """
+    return executor.adapter.get_selected_objects()
+
+
+@mcp.tool()
+def sw_get_mass_properties() -> dict[str, Any]:
+    """Get mass properties of the active SolidWorks model.
+
+    Returns mass (kg), volume (m3), surface area (m2), and center of mass
+    coordinates.  This is a manufacturing sanity check, not a simulation result.
+    Requires an active part or assembly document.
+    """
+    return executor.adapter.get_mass_properties()
+
+
+@mcp.tool()
+def sw_setup_simulation_study(study_name: str = "Static 1", study_type: str = "static") -> dict[str, Any]:
+    """Create or activate a SolidWorks Simulation study on the active model."""
+    return executor.adapter.setup_simulation_study(study_name, study_type)
+
+
+@mcp.tool()
+def sw_apply_simulation_material(material_name: str) -> dict[str, Any]:
+    """Apply a material to the active model for SolidWorks Simulation."""
+    return executor.adapter.apply_simulation_material(material_name)
+
+
+@mcp.tool()
+def sw_add_simulation_fixture(fixture_type: str, entity_name: str, entity_type: str) -> dict[str, Any]:
+    """Add a SolidWorks Simulation fixture to a named active-model entity."""
+    return executor.adapter.add_simulation_fixture(fixture_type, entity_name, entity_type)
+
+
+@mcp.tool()
+def sw_add_simulation_load(
+    load_type: str,
+    entity_name: str,
+    entity_type: str,
+    magnitude: float,
+    direction: list[float] | None = None,
+) -> dict[str, Any]:
+    """Add a SolidWorks Simulation load to a named active-model entity."""
+    return executor.adapter.add_simulation_load(load_type, entity_name, entity_type, magnitude, direction)
+
+
+@mcp.tool()
+def sw_run_simulation_mesh_and_solve() -> dict[str, Any]:
+    """Mesh and solve the active SolidWorks Simulation study."""
+    return executor.adapter.run_simulation_mesh_and_solve()
+
+
+@mcp.tool()
+def sw_get_simulation_results() -> dict[str, Any]:
+    """Read best-effort result summaries from the active SolidWorks Simulation study."""
+    return executor.adapter.get_simulation_results()
+
+
+@mcp.tool()
+def sw_add_dimxpert_dimension(
+    entity_name: str,
+    entity_type: str,
+    dimension_type: str,
+    x: float = 0,
+    y: float = 0,
+    z: float = 0,
+) -> dict[str, Any]:
+    """Add a DimXpert GD&T dimension to the active part by selecting an entity."""
+    return executor.adapter.add_dimxpert_dimension(entity_name, entity_type, dimension_type, x, y, z)
+
+
+@mcp.tool()
+def sw_add_dimxpert_tolerance(dimension_name: str, tolerance_type: str, upper: float, lower: float) -> dict[str, Any]:
+    """Add a tolerance specification to an existing DimXpert dimension."""
+    return executor.adapter.add_dimxpert_tolerance(dimension_name, tolerance_type, upper, lower)
+
+
+@mcp.tool()
+def sw_list_dimxpert_dimensions() -> dict[str, Any]:
+    """List DimXpert dimensions available in the active part."""
+    return executor.adapter.list_dimxpert_dimensions()
+
+
+@mcp.tool()
+def sw_check_interference(component_selectors: list[str] | None = None) -> dict[str, Any]:
+    """Run interference detection on the active SolidWorks assembly.
+
+    Returns interfering component pairs with overlap volume.
+    """
+    return executor.adapter.check_interference(component_selectors)
+
+
+@mcp.tool()
+def sw_create_exploded_view(name: str = "ExplodedView1") -> dict[str, Any]:
+    """Create an exploded view of the active SolidWorks assembly."""
+    return executor.adapter.create_exploded_view(name)
+
+
+@mcp.tool()
+def sw_get_assembly_component_tree() -> dict[str, Any]:
+    """Get component hierarchy and mate information for the active assembly."""
+    return executor.adapter.get_assembly_component_tree()
+
+
+@mcp.tool()
+def sw_list_configurations() -> dict[str, Any]:
+    """List all configurations in the active SolidWorks model."""
+    return executor.adapter.list_configurations()
+
+
+@mcp.tool()
+def sw_activate_configuration(config_name: str) -> dict[str, Any]:
+    """Activate a specific configuration in the active SolidWorks model."""
+    return executor.adapter.activate_configuration(config_name)
+
+
+@mcp.tool()
+def sw_add_configuration(config_name: str, comment: str = "", options: int = 0) -> dict[str, Any]:
+    """Add a new configuration to the active SolidWorks model."""
+    return executor.adapter.add_configuration(config_name, comment, options)
+
+
+@mcp.tool()
+def sw_list_equations() -> dict[str, Any]:
+    """List equations and global variables in the active SolidWorks model."""
+    return executor.adapter.list_equations()
+
+
+@mcp.tool()
+def sw_set_equation(equation_str: str) -> dict[str, Any]:
+    """Add or modify an equation/global variable in the active SolidWorks model."""
+    return executor.adapter.set_equation(equation_str)
+
+
+@mcp.tool()
+def sw_read_properties_offline(file_path: str, configuration: str | None = None) -> dict[str, Any]:
+    """Read custom properties from a SolidWorks document without starting SolidWorks.
+
+    Uses the SolidWorks Document Manager API when available.  Real offline access
+    requires swdocumentmgr.dll registration and the optional
+    SOLIDWORKS_MCP_DOCMGR_LICENSE environment variable for licensed operations.
+    """
+    return executor.adapter.read_document_properties_offline(file_path, configuration)
+
+
+@mcp.tool()
+def sw_write_properties_offline(
+    file_path: str,
+    properties: dict[str, str],
+    configuration: str | None = None,
+) -> dict[str, Any]:
+    """Write custom properties to a SolidWorks document without starting SolidWorks."""
+    return executor.adapter.write_document_properties_offline(file_path, properties, configuration)
+
+
+@mcp.tool()
+def sw_read_configurations_offline(file_path: str) -> dict[str, Any]:
+    """List configurations in a SolidWorks document without starting SolidWorks."""
+    return executor.adapter.read_document_configurations_offline(file_path)
+
+
+@mcp.tool()
+def sw_read_bom_offline(file_path: str) -> dict[str, Any]:
+    """Read BOM components from a SolidWorks assembly document without starting SolidWorks."""
+    return executor.adapter.read_document_bom_offline(file_path)
+
+
+@mcp.tool()
+def sw_insert_bom_table(view_name: str | None = None, template_path: str | None = None) -> dict[str, Any]:
+    """Insert a BOM table into the active SolidWorks drawing."""
+    return executor.adapter.insert_drawing_bom_table(view_name, template_path)
+
+
+@mcp.tool()
+def sw_insert_center_mark(entity_type: str, x: float, y: float, z: float = 0.0) -> dict[str, Any]:
+    """Insert a center mark on a circular drawing entity near the supplied sheet point."""
+    return executor.adapter.insert_drawing_center_mark(entity_type, x, y, z)
+
+
+@mcp.tool()
+def sw_insert_centerline(
+    entity_type: str,
+    x1: float,
+    y1: float,
+    z1: float,
+    x2: float,
+    y2: float,
+    z2: float,
+) -> dict[str, Any]:
+    """Insert a centerline between two drawing entities near the supplied sheet points."""
+    return executor.adapter.insert_drawing_centerline(entity_type, x1, y1, z1, x2, y2, z2)
+
+
 @mcp.resource(
     "solidworks://capabilities",
     title="SolidWorks MCP Capability Catalog",
