@@ -8,6 +8,7 @@ from typing import Any
 
 from solidworks_mcp.adapters.base import CADAdapter
 from solidworks_mcp.config import SolidWorksMCPConfig
+from solidworks_mcp.drawing_recipe import drawing_recipe_contract
 from solidworks_mcp.feature_graph import atomic_dimension_ids_from_metadata
 from solidworks_mcp.schemas import (
     bom_assembly_parameters_from_plan,
@@ -80,6 +81,7 @@ class MockCADAdapter(CADAdapter):
         self._drawing_dimension_status = "not_requested"
         self._drawing_dimension_result: dict[str, Any] = {"status": "not_requested"}
         self._drawing_metadata_note_result: dict[str, Any] = {"status": "not_requested"}
+        self._drawing_recipe_result: dict[str, Any] = {"status": "not_requested"}
         self._material_status = "not_requested"
         self._material_result: dict[str, Any] = {"status": "not_requested"}
         self._custom_property_status = "not_requested"
@@ -827,6 +829,7 @@ class MockCADAdapter(CADAdapter):
         self._drawing_dimension_status = "not_requested"
         self._drawing_dimension_result = {"status": "not_requested"}
         self._drawing_metadata_note_result = {"status": "not_requested"}
+        self._drawing_recipe_result = {"status": "not_requested"}
         self._material_status = "not_requested"
         self._material_result = {"status": "not_requested"}
         self._custom_property_status = "not_requested"
@@ -1935,6 +1938,20 @@ class MockCADAdapter(CADAdapter):
         else:
             self._drawing_dimension_status = "not_requested"
             self._drawing_dimension_result = {"status": "not_requested"}
+        recipe_contract = drawing_recipe_contract(plan)
+        recipe_note_result = {
+            "status": "recipe_note_created",
+            "method": "mock_manifest_note",
+            "text": recipe_contract["note_text"],
+        }
+        self._drawing_recipe_result = {
+            "status": "recipe_manifest_created",
+            "intent": recipe_contract["intent"],
+            "standard": recipe_contract["standard"],
+            "recipe": recipe_contract["recipe"],
+            "note_result": recipe_note_result,
+        }
+        self.record_event("drawing.recipe_contract", "completed", self._drawing_recipe_result)
         self._drawing_metadata_note_result = _mock_metadata_note_result(plan)
         if existing_model is not None:
             self._drawing_metadata_note_result = {
@@ -1973,6 +1990,10 @@ class MockCADAdapter(CADAdapter):
                     "dimension_status": self._drawing_dimension_status,
                     "dimension_result": self._drawing_dimension_result,
                     "metadata_note_result": self._drawing_metadata_note_result,
+                    "intent": recipe_contract["intent"],
+                    "standard": recipe_contract["standard"],
+                    "recipe": recipe_contract["recipe"],
+                    "recipe_note_result": recipe_note_result,
                     "note": "Mock drawing manifest. Generate the real drawing on Windows with SolidWorks.",
                 },
                 indent=2,
@@ -2079,6 +2100,7 @@ class MockCADAdapter(CADAdapter):
             "drawing_dimension_status": self._drawing_dimension_status,
             "drawing_dimension_result": self._drawing_dimension_result,
             "drawing_metadata_note_result": self._drawing_metadata_note_result,
+            "drawing_recipe_result": self._drawing_recipe_result,
             "material_status": self._material_status,
             "material_result": self._material_result,
             "custom_property_status": self._custom_property_status,

@@ -385,6 +385,8 @@ def _production_verdict_from_diagnostics(diagnostics: dict[str, Any]) -> dict[st
     """Return a compact top-level production verdict from diagnostics."""
 
     acceptance = diagnostics.get("production_acceptance_result") if isinstance(diagnostics, dict) else None
+    drawing_review = diagnostics.get("drawing_review") if isinstance(diagnostics, dict) else None
+    drawing_review_summary = drawing_review if isinstance(drawing_review, dict) else None
     if not isinstance(acceptance, dict) or not acceptance:
         return {
             "status": "not_evaluated",
@@ -392,6 +394,7 @@ def _production_verdict_from_diagnostics(diagnostics: dict[str, Any]) -> dict[st
             "failures": [],
             "repair_actions": [],
             "summary": {},
+            "drawing_review": drawing_review_summary,
         }
     failures = acceptance.get("failures", [])
     summary = acceptance.get("summary", {})
@@ -401,6 +404,7 @@ def _production_verdict_from_diagnostics(diagnostics: dict[str, Any]) -> dict[st
         "failures": failures,
         "repair_actions": acceptance.get("repair_actions") or build_repair_actions(failures, summary),
         "summary": summary,
+        "drawing_review": drawing_review_summary,
     }
 
 

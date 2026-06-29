@@ -20,6 +20,7 @@ from typing import Any
 
 from solidworks_mcp.adapters.base import CADAdapter
 from solidworks_mcp.config import SolidWorksMCPConfig
+from solidworks_mcp.drawing_recipe import drawing_recipe_contract
 from solidworks_mcp.feature_graph import atomic_dimension_ids_from_metadata
 from solidworks_mcp.schemas import (
     bom_assembly_parameters_from_plan,
@@ -91,6 +92,17 @@ try:
         _SW_DIMXPERT_AVAILABLE = True
 except Exception:
     pass  # swdimxpert.tlb registration is best-effort
+
+_SW_SIMULATION_AVAILABLE = False
+try:
+    import comtypes.client
+
+    SW_SIMULATION_TLB = r"D:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\cosworks.tlb"
+    if Path(SW_SIMULATION_TLB).exists():
+        comtypes.client.GetModule(SW_SIMULATION_TLB)
+        _SW_SIMULATION_AVAILABLE = True
+except Exception:
+    pass  # cosworks.tlb registration is best-effort
 
 _SW_DOCMGR_AVAILABLE = False
 try:
@@ -352,6 +364,7 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._drawing_dimension_status = "not_requested"
         self._drawing_dimension_result: dict[str, Any] = {"status": "not_requested"}
         self._drawing_metadata_note_result: dict[str, Any] = {"status": "not_requested"}
+        self._drawing_recipe_result: dict[str, Any] = {"status": "not_requested"}
         self._material_status = "not_requested"
         self._material_result: dict[str, Any] = {"status": "not_requested"}
         self._custom_property_status = "not_requested"
@@ -646,7 +659,7 @@ class SolidWorksCOMAdapter(CADAdapter):
                 if feature is None:
                     continue
                 name = _call_or_get(feature, "Name")
-                ftype = _call_or_get(feature, "GetTypeName") or _safe_get_str(feature, "GetTypeName")
+                ftype = _call_or_get(feature, "GetTypeName")
                 suppressed = False
                 try:
                     suppressed = bool(getattr(feature, "IsSuppressed", False))
@@ -1855,6 +1868,7 @@ class SolidWorksCOMAdapter(CADAdapter):
         self._drawing_dimension_status = "not_requested"
         self._drawing_dimension_result = {"status": "not_requested"}
         self._drawing_metadata_note_result = {"status": "not_requested"}
+        self._drawing_recipe_result = {"status": "not_requested"}
         self._material_status = "not_requested"
         self._material_result = {"status": "not_requested"}
         self._custom_property_status = "not_requested"
@@ -2282,6 +2296,16 @@ class SolidWorksCOMAdapter(CADAdapter):
             if dimension_event_status == "failed":
                 self._warnings.append(f"drawing_basic_dimensions:{dimension_result.get('status')}")
             self.record_event("drawing.basic_dimensions", dimension_event_status, dimension_result)
+        recipe_contract = drawing_recipe_contract(plan)
+        recipe_note_result = self._try_insert_drawing_recipe_note(recipe_contract, view_result)
+        self._drawing_recipe_result = {
+            "status": "recipe_manifest_created",
+            "intent": recipe_contract["intent"],
+            "standard": recipe_contract["standard"],
+            "recipe": recipe_contract["recipe"],
+            "note_result": recipe_note_result,
+        }
+        self.record_event("drawing.recipe_contract", "completed", self._drawing_recipe_result)
         view_status = str(view_result.get("status", "failed"))
         dimension_status = str(dimension_result.get("status", "not_requested"))
         callout_status = str(callout_result.get("status", "hole_callout_failed"))
@@ -2301,9 +2325,33 @@ class SolidWorksCOMAdapter(CADAdapter):
 
         drawing_path = workspace / f"{safe_output_name(plan.name)}.slddrw"
         self._save_as(self._drawing, drawing_path)
+        drawing_manifest_path = workspace / f"{safe_output_name(plan.name)}.drawing.json"
+        drawing_manifest_path.write_text(
+            json.dumps(
+                {
+                    "plan": plan.name,
+                    "units": plan.units,
+                    "profile": profile.to_dict(),
+                    "views": view_result.get("views", []),
+                    "view_status": view_status,
+                    "view_result": view_result,
+                    "annotation_status": callout_status,
+                    "annotation_result": callout_result,
+                    "dimension_status": dimension_status,
+                    "dimension_result": dimension_result,
+                    "metadata_note_result": metadata_note_result,
+                    "intent": recipe_contract["intent"],
+                    "standard": recipe_contract["standard"],
+                    "recipe": recipe_contract["recipe"],
+                    "recipe_note_result": recipe_note_result,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         self._active_drawing_path = drawing_path
         self._active_drawing_title = self._document_title(self._drawing) or drawing_path.name
-        return {"slddrw": path_to_string(drawing_path)}
+        return {"drawing_manifest": path_to_string(drawing_manifest_path), "slddrw": path_to_string(drawing_path)}
 
     def export_outputs(self, plan: ModelPlan, formats: tuple[str, ...]) -> dict[str, str]:
         """Export part and drawing documents to the requested formats."""
@@ -2547,6 +2595,7 @@ class SolidWorksCOMAdapter(CADAdapter):
             "drawing_dimension_status": self._drawing_dimension_status,
             "drawing_dimension_result": self._drawing_dimension_result,
             "drawing_metadata_note_result": self._drawing_metadata_note_result,
+            "drawing_recipe_result": self._drawing_recipe_result,
             "material_status": self._material_status,
             "material_result": self._material_result,
             "custom_property_status": self._custom_property_status,
@@ -2929,7 +2978,7 @@ class SolidWorksCOMAdapter(CADAdapter):
                     "verified_closed": None,
                 }
                 resolution = self._resolve_run_created_document(lookup_name)
-                resolved_document = resolution.pop("document", None)
+                resolution.pop("document", None)
                 attempt["resolution"] = resolution
                 if not resolution.get("is_run_created"):
                     attempt["skipped"] = True
@@ -6640,6 +6689,63 @@ class SolidWorksCOMAdapter(CADAdapter):
 
         return {"deferred_to": "generate_drawing"}
 
+    def _try_insert_drawing_recipe_note(
+        self,
+        recipe_contract: dict[str, Any],
+        view_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Insert a visible recipe note that mirrors the machine-readable drawing manifest."""
+
+        drawing = self._drawing
+        text = str(recipe_contract.get("note_text") or "")
+        if drawing is None:
+            return {"status": "no_drawing", "text": text, "failure_reason": "No active drawing document."}
+        layout = view_result.get("layout", {}) if isinstance(view_result, dict) else {}
+        safe_rect = layout.get("safe_rect_m", {}) if isinstance(layout, dict) else {}
+        x_position = max(float(safe_rect.get("left") or 0.020) + 0.010, 0.050)
+        y_position = max(float(safe_rect.get("bottom") or 0.070) + 0.020, 0.095)
+        result: dict[str, Any] = {
+            "status": "recipe_note_failed",
+            "text": text,
+            "position_m": {"x": x_position, "y": y_position},
+            "attempts": [],
+        }
+        for method_name, args in (
+            ("CreateText", (text, x_position, y_position, 0.0, 0.0032, 0.0)),
+            ("InsertNote", (text,)),
+        ):
+            method = getattr(drawing, method_name, None)
+            if not callable(method):
+                result["attempts"].append({"method": method_name, "available": False})
+                continue
+            started_at = perf_counter()
+            try:
+                note = method(*args)
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "drawing_recipe_note", "text": text},
+                    result=note,
+                    started_at=started_at,
+                )
+                created = note is not None and note is not False
+                result["attempts"].append({"method": method_name, "available": True, "created": created})
+                if created:
+                    result.update({"status": "recipe_note_created", "method": method_name})
+                    self.record_event("drawing.recipe_note", "completed", result)
+                    return result
+            except Exception as exc:
+                self.record_com_call(
+                    f"DrawingDoc.{method_name}",
+                    {"purpose": "drawing_recipe_note", "text": text},
+                    error=exc,
+                    started_at=started_at,
+                )
+                result["attempts"].append({"method": method_name, "available": True, "error": str(exc)})
+        result["failure_reason"] = "SolidWorks did not create the drawing recipe note."
+        self._warnings.append("drawing_recipe_note:recipe_note_failed")
+        self.record_event("drawing.recipe_note", "failed", result)
+        return result
+
     def _try_insert_metadata_note(self, plan: ModelPlan) -> dict[str, Any]:
         """Insert visible drawing metadata derived from requested custom properties."""
 
@@ -8130,7 +8236,6 @@ class SolidWorksCOMAdapter(CADAdapter):
         section_x = safe_left + main_width * 0.46
         section_y = safe_bottom + safe_height * 0.63
         source_x = safe_left + main_width + side_width * 0.54
-        source_y = safe_bottom + safe_height * 0.74
         end_x = source_x
         end_y = safe_bottom + safe_height * 0.68
         iso_x = end_x
@@ -14199,7 +14304,6 @@ def _basic_dimension_specs(params: dict[str, float], units: str, views: dict[str
     top_x, top_y = _drawing_view_position(top_view)
     front_x, front_y = _drawing_view_position(front_view)
     thickness_x, thickness_y = _drawing_view_position(thickness_view)
-    top_scale = _drawing_view_scale(top_view)
     front_scale = _drawing_view_scale(front_view)
     thickness_scale = _drawing_view_scale(thickness_view)
 
@@ -15461,21 +15565,16 @@ def _existing_model_overall_dimension_specs(
                 continue
             if numeric > 0:
                 model_values.append(numeric)
-    max_model_dim = max(model_values) if model_values else None
     min_model_dim = min(model_values) if model_values else None
 
     end_outline = _view_outline_for_role("end", views, view_result)
     section_outline = _view_outline_for_role("section", views, view_result)
-    flat_pattern_outline = _view_outline_for_role("flat_pattern", views, view_result)
     specs: list[dict[str, Any]] = []
     edge_types = ("EDGE", "SKETCHSEGMENT", "EXTSKETCHSEGMENT", "LINE", "ARC")
 
     # ══════════════════════════════════════════════════════════
     #  FALLBACK: Use original rotational logic (handles all geometry kinds through outline-based edge selection)
     # ══════════════════════════════════════════════════════════
-    diameter_outline = end_outline or section_outline
-    diameter_role = "end" if end_outline is not None else "section"
-
     # Always try overall length first
     length_outline = section_outline or end_outline
     length_role = "section" if section_outline is not None else "end"

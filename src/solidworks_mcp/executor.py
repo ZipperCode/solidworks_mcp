@@ -21,13 +21,13 @@ from solidworks_mcp.debug import (
     write_delivery_manifest,
     write_environment_snapshot,
 )
+from solidworks_mcp.drawing_review import assess_drawing_review
 from solidworks_mcp.feature_graph import FeatureGraph, atomic_dimension_ids_from_metadata
 from solidworks_mcp.repair import build_repair_actions
 from solidworks_mcp.schemas import (
     bom_assembly_parameters_from_plan,
     bracket_basic_dimension_ids_from_plan,
     center_hole_flange_basic_dimension_ids_from_plan,
-    center_hole_flange_parameters_from_plan,
     center_hole_plate_basic_dimension_ids_from_plan,
     end_cap_basic_dimension_ids_from_plan,
     ExecutionReport,
@@ -450,6 +450,7 @@ class ModelPlanExecutor:
                 preview_files,
                 force_cad_content_failure=self._config.force_cad_content_failure,
             )
+            diagnostics["drawing_review"] = assess_drawing_review(plan, diagnostics)
             report = ExecutionReport(
                 ok=True,
                 adapter=self.adapter_name,
@@ -628,6 +629,7 @@ def _diagnostics_from_inspection(inspection: dict[str, Any]) -> dict[str, Any]:
         "drawing_dimension_status": inspection.get("drawing_dimension_status"),
         "drawing_dimension_result": inspection.get("drawing_dimension_result"),
         "drawing_metadata_note_result": inspection.get("drawing_metadata_note_result"),
+        "drawing_recipe_result": inspection.get("drawing_recipe_result"),
         "material_status": inspection.get("material_status"),
         "material_result": inspection.get("material_result"),
         "custom_property_status": inspection.get("custom_property_status"),
