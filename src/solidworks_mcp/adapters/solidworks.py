@@ -116,6 +116,10 @@ except Exception:
     pass  # Best-effort, only works on Windows with SW Document Manager installed
 
 
+def _drawing_view_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in result.items() if key != "view"}
+
+
 def _get_swdm_application(license_key: str | None = None) -> Any | None:
     """Get SwDMApplication instance. Returns None if unavailable."""
 
@@ -8094,7 +8098,7 @@ class SolidWorksCOMAdapter(CADAdapter):
             "centerline": centerline_result,
             "center_mark": center_mark_rotational_result,
             "is_sheet_metal": is_sheet_metal,
-            "flat_pattern": flat_pattern_result if is_sheet_metal else None,
+            "flat_pattern": _drawing_view_result_payload(flat_pattern_result) if is_sheet_metal else None,
         }
         status = "created" if not missing_roles else f"partial:{len(views)}/{len(required_roles)}"
         return {
