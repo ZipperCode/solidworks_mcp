@@ -659,6 +659,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
+    { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
@@ -671,6 +672,7 @@ windows = [
 requires-dist = [
     { name = "comtypes", marker = "extra == 'windows'", specifier = ">=1.4.10" },
     { name = "mcp", specifier = ">=1.12.4" },
+    { name = "pydantic", specifier = ">=2.0" },
     { name = "pywin32", marker = "extra == 'windows'", specifier = ">=306" },
 ]
 provides-extras = ["windows"]

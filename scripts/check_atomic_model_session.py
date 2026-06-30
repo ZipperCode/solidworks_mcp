@@ -15,10 +15,10 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from solidworks_mcp.adapters.mock import MockCADAdapter
-from solidworks_mcp.config import SolidWorksMCPConfig
-from solidworks_mcp.executor import ModelPlanExecutor
-from solidworks_mcp.sessions import AtomicSessionManager
+from solidworks_mcp.adapters.mock import MockCADAdapter  # noqa: E402
+from solidworks_mcp.config import SolidWorksMCPConfig  # noqa: E402
+from solidworks_mcp.executor import ModelPlanExecutor  # noqa: E402
+from solidworks_mcp.sessions import AtomicSessionManager  # noqa: E402
 
 
 def main() -> None:
@@ -48,6 +48,9 @@ def main() -> None:
 
         full_protocol = _stage_full_atomic_protocol_session(sessions)
         _assert(full_protocol.get("ok") is True, f"Expected full atomic protocol coverage: {full_protocol}")
+
+        flat_operation = _stage_flat_atomic_operation_session(sessions)
+        _assert(flat_operation.get("ok") is True, f"Expected flat atomic operation compatibility: {flat_operation}")
 
         missing_confirmation = _run_valid_hole_session(sessions, confirmed=False)
         _assert(missing_confirmation.get("ok") is False, f"Expected missing confirmation: {missing_confirmation}")
@@ -142,6 +145,7 @@ def main() -> None:
             "checks": [
                 "atomic_session_accepted",
                 "full_atomic_protocol_covered",
+                "flat_atomic_operation_compatible",
                 "missing_confirmation_rejected",
                 "bad_reference_rejected",
                 "atomic_bad_references_rejected",
@@ -195,6 +199,30 @@ def _run_valid_hole_session(sessions: AtomicSessionManager, confirmed: bool = Tr
         result = sessions.apply_model_operation(session_id, operation)
         _assert(result.get("ok") is True, f"Could not stage {operation['op']}: {result}")
     return sessions.finalize_model_session(session_id, confirmed=confirmed)
+
+
+def _stage_flat_atomic_operation_session(sessions: AtomicSessionManager) -> dict:
+    """Stage common agent-emitted flat operation fields through normalization."""
+
+    start = sessions.start_model_session("Atomic flat operation compatibility")
+    _assert(start.get("ok") is True, f"Could not start flat-operation session: {start}")
+    session_id = start["session_id"]
+    flat_sketch = {
+        "id": "flat_sketch",
+        "op": "create_sketch",
+        "plane": "front",
+        "entities": [{"id": "flat_rect", "type": "center_rectangle", "center": [0, 0], "width": 40, "height": 20}],
+    }
+    sketch_result = sessions.apply_model_operation(session_id, flat_sketch)
+    _assert(sketch_result.get("ok") is True, f"Flat create_sketch was not normalized: {sketch_result}")
+    normalized_sketch = sketch_result.get("operation") or {}
+    _assert((normalized_sketch.get("parameters") or {}).get("plane") == "front", f"Wrong normalized sketch: {normalized_sketch}")
+    _assert("plane" not in normalized_sketch, f"Flat sketch field leaked into normalized operation: {normalized_sketch}")
+
+    flat_extrude = {"id": "flat_boss", "op": "extrude", "sketch_id": "flat_sketch", "depth": 8}
+    extrude_result = sessions.apply_model_operation(session_id, flat_extrude)
+    _assert(extrude_result.get("ok") is True, f"Flat extrude was not normalized: {extrude_result}")
+    return extrude_result
 
 
 def _stage_full_atomic_protocol_session(sessions: AtomicSessionManager) -> dict:

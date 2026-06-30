@@ -199,6 +199,7 @@ class ModelOperation:
         parameters = raw.get("parameters", {})
         if not isinstance(parameters, dict):
             raise PlanValidationError(f"operations[{index}].parameters must be an object")
+        parameters = _normalize_flat_operation_parameters(op, raw, parameters, index)
 
         _validate_required_operation_fields(op, parameters, index)
         return cls(
@@ -217,6 +218,51 @@ class ModelOperation:
             "description": self.description,
             "parameters": self.parameters,
         }
+
+
+def _normalize_flat_operation_parameters(
+    op: str,
+    raw: dict[str, Any],
+    parameters: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    """Move common agent-emitted top-level operation fields into parameters."""
+
+    field_names = _operation_parameter_field_names(op)
+    merged = dict(parameters)
+    for field_name in field_names:
+        if field_name not in raw:
+            continue
+        if field_name in merged and merged[field_name] != raw[field_name]:
+            raise PlanValidationError(
+                f"operations[{index}] has conflicting top-level and parameters.{field_name} values"
+            )
+        merged.setdefault(field_name, raw[field_name])
+    return merged
+
+
+def _operation_parameter_field_names(op: str) -> tuple[str, ...]:
+    """Return known parameter keys that MCP clients often place at operation top level."""
+
+    common_fields = ("target_refs", "targets")
+    fields_by_operation = {
+        "create_plane": ("base_plane", "distance"),
+        "create_sketch": ("plane", "entities", "dimensions", "constraints", "sketch_id"),
+        "extrude": ("sketch_id", "depth", "direction", "merge"),
+        "cut": ("sketch_id", "depth", "direction", "through_all"),
+        "hole": ("target_face", "position", "positions", "diameter", "depth"),
+        "fillet": (*common_fields, "radius"),
+        "chamfer": (*common_fields, "distance"),
+        "linear_pattern": ("seed_id", "direction", "spacing", "count"),
+        "circular_pattern": ("seed_id", "axis", "count", "angle"),
+        "revolve": ("sketch_id", "axis", "angle"),
+        "sweep": ("profile_sketch_id", "profile_id", "path_sketch_id", "path_id"),
+        "loft": ("profile_sketch_ids",),
+        "assign_material": ("material",),
+        "set_custom_properties": ("properties",),
+        "make_drawing": (),
+    }
+    return fields_by_operation.get(op, ())
 
 
 @dataclass(frozen=True)

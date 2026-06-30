@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import JsonValue
 
 from solidworks_mcp.adapters import create_adapter
 from solidworks_mcp.capabilities import capability_catalog_json, capability_category_json
@@ -14,6 +15,8 @@ from solidworks_mcp.executor import ModelPlanExecutor
 from solidworks_mcp.release_diagnostics import diagnose_release_gate_report
 from solidworks_mcp.run_diagnostics import diagnose_run_collection, diagnose_run_directory
 from solidworks_mcp.sessions import AtomicSessionManager
+from solidworks_mcp.tool_schema_guidance import apply_tool_schema_guidance
+from solidworks_mcp.tool_inputs import DrawingProfileInput, ModelPlanInput, OperationInput
 
 
 def build_executor() -> ModelPlanExecutor:
@@ -42,7 +45,7 @@ def connect_solidworks() -> dict[str, Any]:
 
 
 @mcp.tool()
-def validate_model_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def validate_model_plan(plan: ModelPlanInput) -> dict[str, Any]:
     """Validate a restricted JSON model plan before user confirmation.
 
     This is the schema gate for AI-generated ``ModelPlan`` payloads.  It checks
@@ -53,11 +56,11 @@ def validate_model_plan(plan: dict[str, Any]) -> dict[str, Any]:
     ``SUPPORTED_OPERATIONS``.
     """
 
-    return executor.validate_plan(plan).to_dict()
+    return executor.validate_plan(plan.to_plan_dict()).to_dict()
 
 
 @mcp.tool()
-def preflight_environment(plan: dict[str, Any] | None = None) -> dict[str, Any]:
+def preflight_environment(plan: ModelPlanInput | None = None) -> dict[str, Any]:
     """Check SolidWorks MCP runtime prerequisites before confirmed execution.
 
     This performs the same hard-gate checks that ``execute_model_plan`` runs
@@ -66,11 +69,11 @@ def preflight_environment(plan: dict[str, Any] | None = None) -> dict[str, Any]:
     create a part or drawing document.
     """
 
-    return executor.preflight_environment(plan).to_dict()
+    return executor.preflight_environment(plan.to_plan_dict() if plan is not None else None).to_dict()
 
 
 @mcp.tool()
-def execute_model_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[str, Any]:
+def execute_model_plan(plan: ModelPlanInput, confirmed: bool = False) -> dict[str, Any]:
     """Execute a confirmed model plan in an isolated document transaction.
 
     Call this only after the user has reviewed a validated plan and the client
@@ -80,16 +83,16 @@ def execute_model_plan(plan: dict[str, Any], confirmed: bool = False) -> dict[st
     ``artifacts.json`` for later failure diagnosis.
     """
 
-    return executor.execute_plan(plan, confirmed=confirmed).to_dict()
+    return executor.execute_plan(plan.to_plan_dict(), confirmed=confirmed).to_dict()
 
 
 @mcp.tool()
 def start_model_session(
     name: str,
     units: str = "mm",
-    metadata: dict[str, Any] | None = None,
+    metadata: dict[str, JsonValue] | None = None,
     output_formats: list[str] | None = None,
-    drawing_profile: dict[str, Any] | None = None,
+    drawing_profile: DrawingProfileInput | None = None,
 ) -> dict[str, Any]:
     """Start a staged atomic modeling session without creating CAD documents.
 
@@ -105,12 +108,12 @@ def start_model_session(
         units=units,
         metadata=metadata,
         output_formats=output_formats,
-        drawing_profile=drawing_profile,
+        drawing_profile=drawing_profile.model_dump(mode="json") if drawing_profile is not None else None,
     )
 
 
 @mcp.tool()
-def apply_model_operation(session_id: str, operation: dict[str, Any]) -> dict[str, Any]:
+def apply_model_operation(session_id: str, operation: OperationInput) -> dict[str, Any]:
     """Validate and stage one production atomic operation in a model session.
 
     This is the safe planning surface for sketch/extrude/cut/hole/fillet/
@@ -118,7 +121,7 @@ def apply_model_operation(session_id: str, operation: dict[str, Any]) -> dict[st
     and named feature-graph references before the operation can be finalized.
     """
 
-    return atomic_sessions.apply_model_operation(session_id, operation)
+    return atomic_sessions.apply_model_operation(session_id, operation.to_operation_dict())
 
 
 @mcp.tool()
@@ -142,7 +145,7 @@ def abort_model_session(session_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def generate_drawing(plan: dict[str, Any]) -> dict[str, Any]:
+def generate_drawing(plan: ModelPlanInput) -> dict[str, Any]:
     """Generate an engineering drawing for the active model.
 
     Use this when a model already exists in the active adapter session and the
@@ -151,11 +154,11 @@ def generate_drawing(plan: dict[str, Any]) -> dict[str, Any]:
     instead of hiding the model or export status.
     """
 
-    return executor.generate_drawing(plan).to_dict()
+    return executor.generate_drawing(plan.to_plan_dict()).to_dict()
 
 
 @mcp.tool()
-def export_outputs(plan: dict[str, Any], formats: list[str] | None = None) -> dict[str, Any]:
+def export_outputs(plan: ModelPlanInput, formats: list[str] | None = None) -> dict[str, Any]:
     """Export the active model or drawing to requested formats.
 
     Use this to retry file exports from the active adapter session.  The optional
@@ -163,7 +166,7 @@ def export_outputs(plan: dict[str, Any], formats: list[str] | None = None) -> di
     unsupported formats still fail validation through the plan/export schema.
     """
 
-    return executor.export_outputs(plan, formats=formats).to_dict()
+    return executor.export_outputs(plan.to_plan_dict(), formats=formats).to_dict()
 
 
 @mcp.tool()
@@ -560,6 +563,9 @@ def sw_insert_centerline(
 ) -> dict[str, Any]:
     """Insert a centerline between two drawing entities near the supplied sheet points."""
     return executor.adapter.insert_drawing_centerline(entity_type, x1, y1, z1, x2, y2, z2)
+
+
+apply_tool_schema_guidance(mcp)
 
 
 @mcp.resource(
