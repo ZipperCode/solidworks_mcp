@@ -20,6 +20,11 @@ from typing import Any
 
 from solidworks_mcp.adapters.base import CADAdapter
 from solidworks_mcp.config import SolidWorksMCPConfig
+from solidworks_mcp.drawing_layout_fit import (
+    DrawingOutline,
+    DrawingSafeRect,
+    fit_outline_inside_safe_rect,
+)
 from solidworks_mcp.drawing_recipe import drawing_recipe_contract
 from solidworks_mcp.feature_graph import atomic_dimension_ids_from_metadata
 from solidworks_mcp.schemas import (
@@ -7780,6 +7785,8 @@ class SolidWorksCOMAdapter(CADAdapter):
         required_roles = [str(spec[0]) for spec in view_specs]
         created_roles = {str(view.get("role")) for view in views if view.get("role")}
         missing_roles = [role for role in required_roles if role not in created_roles]
+        fit_adjustment_result = self._fit_drawing_views_to_safe_rect(layout, views)
+        layout["fit_adjustment_result"] = fit_adjustment_result
         layout_result = self._verify_standard_drawing_layout(layout, views)
         layout.update(layout_result)
         return {
@@ -8032,6 +8039,8 @@ class SolidWorksCOMAdapter(CADAdapter):
             required_roles.append("flat_pattern")
         created_roles = {str(view.get("role")) for view in views if view.get("role")}
         missing_roles = [role for role in required_roles if role not in created_roles]
+        fit_adjustment_result = self._fit_drawing_views_to_safe_rect(layout, views)
+        layout["fit_adjustment_result"] = fit_adjustment_result
         layout_result = self._verify_standard_drawing_layout(layout, views)
         layout.update(layout_result)
         geometry_profile = layout.get("existing_model_geometry_profile")
@@ -8874,6 +8883,118 @@ class SolidWorksCOMAdapter(CADAdapter):
             "verified_views": verified,
         }
 
+    def _fit_drawing_views_to_safe_rect(self, layout: dict[str, Any], views: list[dict[str, Any]]) -> dict[str, Any]:
+        safe_rect = _drawing_safe_rect_from_layout(layout)
+        if safe_rect is None:
+            return {"status": "safe_rect_unavailable", "adjustments": []}
+        adjustments: list[dict[str, Any]] = []
+        changed_count = 0
+        for summary in views:
+            role = str(summary.get("role") or "")
+            view = self._drawing_view_handles.get(role)
+            if view is None:
+                adjustments.append({"role": role, "status": "view_handle_unavailable"})
+                continue
+            outline = _drawing_outline_from_summary(summary)
+            if outline is None:
+                live_outline = self._drawing_view_outline(view)
+                outline = _drawing_outline_from_sequence(live_outline)
+            if outline is None:
+                adjustments.append({"role": role, "status": "outline_unavailable"})
+                continue
+            try:
+                current_scale = float(summary.get("scale") or _drawing_view_scale(view))
+            except (TypeError, ValueError):
+                current_scale = _drawing_view_scale(view)
+            fit = fit_outline_inside_safe_rect(outline, safe_rect, current_scale)
+            adjustment: dict[str, Any] = {"role": role, **fit.to_dict(), "before_outline": outline.to_dict()}
+            if fit.status == "cannot_fit":
+                adjustments.append(adjustment)
+                continue
+            view_changed = False
+            scale_result: dict[str, Any] | None = None
+            if fit.needs_scale:
+                scale_result = self._set_drawing_view_scale(view, fit.scale)
+                self._rebuild_drawing(f"{role}_view_fit_scale")
+                view_changed = True
+            alignment_result: dict[str, Any] | None = None
+            if fit.needs_scale or fit.needs_position:
+                alignment_result = self._align_drawing_view_outline_center(
+                    view,
+                    fit.target_center.x,
+                    fit.target_center.y,
+                )
+                view_changed = True
+            updated_outline = self._drawing_view_outline(view)
+            post_fit_result = self._post_adjust_drawing_view_fit(
+                role,
+                view,
+                updated_outline,
+                safe_rect,
+                fit.scale,
+            )
+            if post_fit_result.get("changed"):
+                view_changed = True
+                updated_outline = self._drawing_view_outline(view)
+            if updated_outline is not None:
+                summary["outline"] = updated_outline
+            final_fit = post_fit_result.get("fit")
+            if isinstance(final_fit, dict):
+                target_center = final_fit.get("target_center")
+                if isinstance(target_center, dict):
+                    summary["x"] = target_center.get("x", fit.target_center.x)
+                    summary["y"] = target_center.get("y", fit.target_center.y)
+                summary["scale"] = final_fit.get("scale", fit.scale)
+            else:
+                summary["x"] = fit.target_center.x
+                summary["y"] = fit.target_center.y
+                summary["scale"] = fit.scale
+            adjustment["scale_result"] = scale_result
+            adjustment["outline_alignment_result"] = alignment_result
+            adjustment["updated_outline"] = updated_outline
+            adjustment["post_fit_result"] = post_fit_result
+            summary["layout_fit_result"] = adjustment
+            if view_changed:
+                changed_count += 1
+            adjustments.append(adjustment)
+        return {
+            "status": "adjusted" if changed_count else "already_fit",
+            "adjusted_view_count": changed_count,
+            "adjustments": adjustments,
+        }
+
+    def _post_adjust_drawing_view_fit(
+        self,
+        role: str,
+        view: Any,
+        outline: Any,
+        safe_rect: DrawingSafeRect,
+        scale: float,
+    ) -> dict[str, Any]:
+        live_outline = _drawing_outline_from_sequence(outline)
+        if live_outline is None:
+            return {"status": "outline_unavailable", "changed": False}
+        fit = fit_outline_inside_safe_rect(live_outline, safe_rect, scale)
+        result: dict[str, Any] = {
+            "status": fit.status,
+            "changed": False,
+            "fit": fit.to_dict(),
+            "before_outline": live_outline.to_dict(),
+        }
+        if fit.status == "cannot_fit" or not (fit.needs_scale or fit.needs_position):
+            return result
+        if fit.needs_scale:
+            result["scale_result"] = self._set_drawing_view_scale(view, fit.scale)
+            self._rebuild_drawing(f"{role}_view_post_fit_scale")
+        result["outline_alignment_result"] = self._align_drawing_view_outline_center(
+            view,
+            fit.target_center.x,
+            fit.target_center.y,
+        )
+        result["updated_outline"] = self._drawing_view_outline(view)
+        result["changed"] = True
+        return result
+
     def _try_insert_basic_dimensions(
         self,
         plan: ModelPlan,
@@ -9169,24 +9290,11 @@ class SolidWorksCOMAdapter(CADAdapter):
                             error=exc, started_at=started_at)
                         import_attempts.append({"all_views": all_views_flag, "error": str(exc)[:100]})
             result["import_model_dimensions_result"] = {
-                "status": "completed" if import_ok else "failed",
+                "status": "completed_unverified" if import_ok else "failed",
                 "attempts": import_attempts,
-                "created_dimension_count": len(required_dimensions) if import_ok else 0,
+                "created_dimension_count": 0,
+                "trusted_for_required_dimensions": False,
             }
-            if import_ok:
-                result["created_dimensions"] = [
-                    {"id": did, "method": "InsertModelAnnotations3", "is_display_dimension": True,
-                     "classification": "geometry_verified_dimension", "proxy_dimension": False}
-                    for did in required_dimensions
-                ]
-                result["created_dimension_count"] = len(required_dimensions)
-                result["missing_dimensions"] = []
-                result["display_dimension_count"] = len(required_dimensions)
-                result["geometry_verified_dimension_count"] = len(required_dimensions)
-                result["status"] = "basic_dimensions_created"
-                result["dimension_layout_status"] = "existing_model_manufacturing_dimensions_created"
-                self.record_event("drawing.basic_dimensions", "completed", result)
-                return result
         else:
             result["import_model_dimensions_result"] = {
                 "status": "skipped",
@@ -15390,6 +15498,19 @@ def _existing_model_geometry_profile(dimensions: Any) -> dict[str, Any]:
                 closest_ratio = ratio
                 closest_pair = (first, second)
     if closest_pair is not None and closest_ratio <= 0.12:
+        smallest_axis, smallest_value = values[0]
+        middle_value = values[1][1]
+        matched_axes = {closest_pair[0][0], closest_pair[1][0]}
+        if smallest_axis not in matched_axes and smallest_value / max(middle_value, 0.001) <= 0.08:
+            return {
+                "kind": "prismatic",
+                "draft_classification": "imported_prismatic_machining_draft",
+                "reason": "thin_sheet_like_bbox",
+                "matched_axes": [closest_pair[0][0], closest_pair[1][0]],
+                "matched_axis_ratio": closest_ratio,
+                "thin_axis": smallest_axis,
+                "thin_axis_ratio": smallest_value / max(middle_value, 0.001),
+            }
         return {
             "kind": "rotational",
             "draft_classification": "imported_rotational_machining_draft",
@@ -15570,6 +15691,7 @@ def _existing_model_overall_dimension_specs(
             if numeric > 0:
                 model_values.append(numeric)
     min_model_dim = min(model_values) if model_values else None
+    max_model_dim = max(model_values) if model_values else None
 
     end_outline = _view_outline_for_role("end", views, view_result)
     section_outline = _view_outline_for_role("section", views, view_result)
@@ -15579,31 +15701,53 @@ def _existing_model_overall_dimension_specs(
     # ══════════════════════════════════════════════════════════
     #  FALLBACK: Use original rotational logic (handles all geometry kinds through outline-based edge selection)
     # ══════════════════════════════════════════════════════════
-    # Always try overall length first
-    length_outline = section_outline or end_outline
-    length_role = "section" if section_outline is not None else "end"
-    if length_outline is not None:
-        left, bottom, right, top = length_outline
+    if not is_rotational and section_outline is not None:
+        left, bottom, right, top = section_outline
         mid_x = (left + right) / 2.0
         mid_y = (bottom + top) / 2.0
-        height = top - bottom
+        width = right - left
         specs.append({
             "id": "overall_length",
-            "view_role": length_role,
-            "method": "AddVerticalDimension2",
-            "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+            "view_role": "section",
+            "method": "AddHorizontalDimension2",
+            "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
             "edge_selector": "existing_model_extreme_edges",
             "edge_selector_data": {
-                "axis": "y",
-                "expected_length_m": min_model_dim or height,
+                "axis": "x",
+                "expected_length_m": max_model_dim or width,
                 "role": "existing_model_overall_length",
             },
             "points": [
-                {"x": mid_x, "y": bottom, "selection_types": edge_types},
-                {"x": mid_x, "y": top, "selection_types": edge_types},
+                {"x": left, "y": mid_y, "selection_types": edge_types},
+                {"x": right, "y": mid_y, "selection_types": edge_types},
             ],
-            "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
+            "position": {"x": mid_x, "y": top + max(width * 0.20, 0.016)},
         })
+    else:
+        length_outline = section_outline or end_outline
+        length_role = "section" if section_outline is not None else "end"
+        if length_outline is not None:
+            left, bottom, right, top = length_outline
+            mid_x = (left + right) / 2.0
+            mid_y = (bottom + top) / 2.0
+            height = top - bottom
+            specs.append({
+                "id": "overall_length",
+                "view_role": length_role,
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "y",
+                    "expected_length_m": min_model_dim or height,
+                    "role": "existing_model_overall_length",
+                },
+                "points": [
+                    {"x": mid_x, "y": bottom, "selection_types": edge_types},
+                    {"x": mid_x, "y": top, "selection_types": edge_types},
+                ],
+                "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
+            })
 
     # For non-rotational parts: add comprehensive dimension specs
     if not is_rotational:
@@ -15983,6 +16127,43 @@ def _view_outline_for_role(
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def _drawing_safe_rect_from_layout(layout: dict[str, Any]) -> DrawingSafeRect | None:
+    raw_rect = layout.get("safe_rect_m")
+    if not isinstance(raw_rect, dict):
+        return None
+    try:
+        return DrawingSafeRect(
+            left=float(raw_rect["left"]),
+            bottom=float(raw_rect["bottom"]),
+            right=float(raw_rect["right"]),
+            top=float(raw_rect["top"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _drawing_outline_from_summary(summary: dict[str, Any]) -> DrawingOutline | None:
+    return _drawing_outline_from_sequence(summary.get("outline"))
+
+
+def _drawing_outline_from_sequence(value: Any) -> DrawingOutline | None:
+    sequence = _as_sequence(value)
+    if len(sequence) < 4:
+        return None
+    try:
+        outline = DrawingOutline(
+            left=float(sequence[0]),
+            bottom=float(sequence[1]),
+            right=float(sequence[2]),
+            top=float(sequence[3]),
+        )
+    except (TypeError, ValueError):
+        return None
+    if outline.right <= outline.left or outline.top <= outline.bottom:
+        return None
+    return outline
 
 
 def _horizontal_outline_point_sets(outline: list[float], edge_types: tuple[str, ...]) -> list[list[dict[str, Any]]]:
