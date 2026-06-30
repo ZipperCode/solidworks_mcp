@@ -41,11 +41,27 @@ REFERENCE_PROJECTS: dict[str, dict[str, str]] = {
         "url": "https://github.com/angelsix/solidworks-api",
         "usage": "Long-term C# wrapper concepts for properties, annotations, add-ins, and app state.",
     },
+    "solidworks-api-mcp": {
+        "url": "https://github.com/kilwizac/solidworks-api-mcp",
+        "usage": "Read-only SolidWorks API lookup/search surface; candidate source for local API documentation assistance.",
+    },
+    "solidworks-macro-diagnostics-mcp": {
+        "url": "https://github.com/ladla90077-web/solidworks-mcp",
+        "usage": "Macro execution diagnostics, STA worker discipline, RunMacro2 result capture, and log/watchdog ideas.",
+    },
+    "SolidworksMCP-python": {
+        "url": "https://github.com/andrewbartels1/SolidworksMCP-python",
+        "usage": "Broad tool taxonomy, security configuration examples, and COM complexity-analysis references.",
+    },
+    "solidworks-mcp-pro": {
+        "url": "https://github.com/ANYLXB/solidworks-mcp-pro",
+        "usage": "Controlled JSON specifications and industry-template workflow inspiration.",
+    },
 }
 
 
 CAPABILITY_CATALOG: dict[str, Any] = {
-    "schema_version": "2026-06-06.1",
+    "schema_version": "2026-06-30.1",
     "purpose": (
         "Describe current and future SolidWorks MCP protocol capabilities for planning. "
         "This catalog is not an execution whitelist."
@@ -1240,6 +1256,86 @@ CAPABILITY_CATALOG: dict[str, Any] = {
                     "dependencies": ["adapter.capture_previews"],
                     "references": ["solidworks-automation-skill"],
                     "notes": "Preview capture is part of execute_model_plan finalization.",
+                },
+            ],
+        },
+        "external_reference_adoption": {
+            "name": "External MCP adoption candidates",
+            "purpose": (
+                "Track useful ideas found in other SolidWorks/CAD MCP servers without expanding the "
+                "current executable protocol surface."
+            ),
+            "future_adapter_entry": "docs/external-mcp-adoption.md and future read-only diagnostics helpers",
+            "capabilities": [
+                {
+                    "id": "knowledge.solidworks_api_lookup",
+                    "status": "planned",
+                    "purpose": "Expose local read-only SolidWorks API method, interface, enum, and example lookup to planning clients.",
+                    "suggested_inputs": ["method name", "interface name", "enum name", "free-text API query"],
+                    "expected_outputs": ["method signature", "interface members", "enum values", "related examples", "source reference"],
+                    "dependencies": [
+                        "local SolidWorks API documentation index",
+                        "read-only MCP tool or resource wrapper",
+                        "license/provenance review for bundled docs",
+                    ],
+                    "future_adapter_entry": "knowledge lookup module; no SolidWorks COM session required",
+                    "references": ["solidworks-api-mcp"],
+                    "notes": "Highest-value external adoption candidate because it improves planning and diagnostics without mutating CAD state. Do not bundle large generated indexes until source, license, and repository-size impact are reviewed.",
+                },
+                {
+                    "id": "diagnostics.com_strategy_trace",
+                    "status": "planned",
+                    "purpose": "Record COM API strategy choices, parameter variants, fallback attempts, and normalized failure reasons for complex SolidWorks calls.",
+                    "suggested_inputs": ["operation id", "adapter attempt log", "COM method family"],
+                    "expected_outputs": ["strategy_attempts", "selected_api", "fallback_reason", "failure_class", "repair_hint"],
+                    "dependencies": ["SolidWorksCOMAdapter event recorder", "run diagnostics", "adapter-specific COM wrappers"],
+                    "future_adapter_entry": "diagnostic event schema around complex adapter calls",
+                    "references": ["SolidworksMCP-TS", "SolidworksMCP-python"],
+                    "notes": "Diagnostic-only adoption. It must not widen ModelPlan operations or bypass the trusted workflow policy.",
+                },
+                {
+                    "id": "macros.controlled_run_diagnostics",
+                    "status": "research",
+                    "purpose": "Investigate allowlisted, run-scoped macro diagnostics for installed trusted macro projects.",
+                    "suggested_inputs": ["macro id", "run directory", "explicit confirmation", "allowlist entry"],
+                    "expected_outputs": ["RunMacro2 return value", "error code", "warning code", "macro log summary", "dialog/watchdog result"],
+                    "dependencies": ["macro allowlist", "environment gate", "run-dir isolation", "operator approval policy"],
+                    "future_adapter_entry": "trusted macro diagnostics helper; never arbitrary macro execution",
+                    "references": ["solidworks-macro-diagnostics-mcp"],
+                    "notes": "Keep macros.generated_swb_execution and macros.general_generation blocked. This research item is only for a future allowlisted diagnostic path.",
+                },
+                {
+                    "id": "drawing.template_diagnostics",
+                    "status": "planned",
+                    "purpose": "Add read-only drawing-template diagnostics before manufacturing drawing generation.",
+                    "suggested_inputs": ["drawing template path", "sheet size", "projection", "drawing profile"],
+                    "expected_outputs": ["template_status", "sheet metadata", "view-anchor strategy", "dimension-placement warnings"],
+                    "dependencies": ["preflight_environment", "SolidWorks drawing helpers", "run report diagnostics"],
+                    "future_adapter_entry": "drawing template preflight and diagnostic report fields",
+                    "references": ["SolidworksMCP-TS", "CSharpAndSolidWorks"],
+                    "notes": "This should improve real template/openability failures without claiming drawing generation success.",
+                },
+                {
+                    "id": "workflow.controlled_industry_templates",
+                    "status": "research",
+                    "purpose": "Evaluate additional controlled workflow families such as flanges or tube sheets as typed ModelPlan recipes.",
+                    "suggested_inputs": ["recipe id", "typed parameters", "material and drawing profile"],
+                    "expected_outputs": ["normalized ModelPlan", "trusted workflow evidence", "production gate checklist"],
+                    "dependencies": ["recipe schema", "mock adapter dry-run", "real SolidWorks release gate", "drawing acceptance rules"],
+                    "future_adapter_entry": "new controlled workflow recipes after acceptance criteria exist",
+                    "references": ["solidworks-mcp-pro"],
+                    "notes": "Recipe ideas can enter planning only after they preserve this project's confirmation, preflight, artifact, cleanup, and offline diagnosis contract.",
+                },
+                {
+                    "id": "exchange.neutral_file_inspection",
+                    "status": "planned",
+                    "purpose": "Enrich CAD exchange-file validation with offline STEP, IGES, DXF, and Parasolid metadata inspection.",
+                    "suggested_inputs": ["export artifact path", "expected format", "run artifact index"],
+                    "expected_outputs": ["format metadata", "entity counts", "unit hints", "parse warnings", "artifact_content_result details"],
+                    "dependencies": ["offline parser selection", "artifact_content_result", "diagnose_run"],
+                    "future_adapter_entry": "offline artifact-content verifier extension",
+                    "references": ["solidworks-api-mcp"],
+                    "notes": "Adopt only as an offline verifier. Open/import validation through SolidWorks still remains the production authority for native workflows.",
                 },
             ],
         },

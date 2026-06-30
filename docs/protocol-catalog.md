@@ -2,7 +2,7 @@
 
 本文档说明当前 SolidWorks MCP 的“能力目录”。它用于规划、提示词编排和后续 adapter 设计，不等同于可执行操作白名单。
 
-可执行入口当前是 15 个 MCP tools：
+当前 MCP tool surface 以 `CAPABILITY_CATALOG.execution_policy.available_tools` 为准；截至本目录版本为 52 个 tools。核心交付入口包括：
 
 - `connect_solidworks`
 - `validate_model_plan`
@@ -49,6 +49,21 @@ Prompt：
 - [wzyn20051216/solidworks-automation-skill](https://github.com/wzyn20051216/solidworks-automation-skill)：Python 自动化流程、自审查、预览和工程验收习惯。
 - [painezeng/CSharpAndSolidWorks](https://github.com/painezeng/CSharpAndSolidWorks)：工程图、尺寸、模板、BOM、选择和导出类 API 例子。
 - [angelsix/solidworks-api](https://github.com/angelsix/solidworks-api)：C# wrapper、属性、注解、材料、应用状态和长期扩展参考。
+- [kilwizac/solidworks-api-mcp](https://github.com/kilwizac/solidworks-api-mcp)：只读 SolidWorks API method/search/interface/enum/examples 查询形态。
+- [ladla90077-web/solidworks-mcp](https://github.com/ladla90077-web/solidworks-mcp)：宏诊断、`RunMacro2` 结果捕获、STA worker、日志/watchdog 思路。
+- [andrewbartels1/SolidworksMCP-python](https://github.com/andrewbartels1/SolidworksMCP-python)：大工具面、COM 复杂度分析和安全配置参考。
+- [ANYLXB/solidworks-mcp-pro](https://github.com/ANYLXB/solidworks-mcp-pro)：受控 JSON 规格和行业模板 workflow 灵感。
+
+## External MCP Adoption Backlog
+
+完整采纳路线见 [external-mcp-adoption.md](external-mcp-adoption.md)。当前只把外部项目转为 backlog，不把它们直接加入执行白名单：
+
+- `knowledge.solidworks_api_lookup` planned：优先落地只读 API 文档/接口/枚举/示例查询，不需要 SolidWorks COM session。
+- `diagnostics.com_strategy_trace` planned：把复杂 COM 调用的参数变体、fallback、失败原因和 repair hint 写入 run diagnostics。
+- `drawing.template_diagnostics` planned：工程图生成前诊断 drawing template、sheet、projection、view anchor 和尺寸布局风险。
+- `macros.controlled_run_diagnostics` research：只研究 allowlisted installed macro project 的 run-scoped 诊断；任意宏生成/执行继续 blocked。
+- `workflow.controlled_industry_templates` research：从外部法兰/管板等模板项目提炼 typed recipe，但必须独立通过 production gate。
+- `exchange.neutral_file_inspection` planned：增强 STEP/IGES/DXF/Parasolid 离线内容检查，不替代真实 SolidWorks open/import gate。
 
 ## Categories
 
@@ -253,6 +268,28 @@ Blocked：
 - `solidworks_mcp.run_diagnostics.diagnose_run_directory`
 - `solidworks_mcp.run_diagnostics.diagnose_run_collection`
 - adapter preview helpers
+
+### `external_reference_adoption`
+
+用途：把外部 SolidWorks/CAD MCP 项目中的可复用机制沉淀为本项目 backlog，不扩大当前 executable protocol surface。
+
+Planned：
+
+- `knowledge.solidworks_api_lookup`：本地只读 SolidWorks API method/interface/enum/examples 查询；优先作为 planning/diagnostics 辅助。
+- `diagnostics.com_strategy_trace`：结构化记录复杂 COM method family、参数变体、fallback reason、failure_class 和 repair_hint。
+- `drawing.template_diagnostics`：创建工程图前诊断 template/sheet/projection/view-anchor/dimension-placement 风险。
+- `exchange.neutral_file_inspection`：对 STEP、IGES、DXF、Parasolid 导出做离线 metadata/entity/unit 检查，并并入 `artifact_content_result`。
+
+Research：
+
+- `macros.controlled_run_diagnostics`：allowlist、run-dir isolation、环境门禁和人工确认全部具备后，才研究受控宏诊断。
+- `workflow.controlled_industry_templates`：把外部行业模板转为 typed controlled workflow recipe，并用真实 SolidWorks release gate 验收。
+
+边界：
+
+- 这些条目不能写入 `SUPPORTED_OPERATIONS`。
+- `macros.generated_swb_execution` 和 `macros.general_generation` 仍是 blocked。
+- 外部项目只作为机制参考，不复制其开放式工具面。
 
 ### `advanced_manufacturing`
 
