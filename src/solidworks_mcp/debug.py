@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import platform
 import sys
@@ -203,6 +202,9 @@ def write_environment_snapshot(
             "SOLIDWORKS_MCP_REQUIRE_DIRECT_HOLE_CALLOUT": config.require_direct_hole_callout,
             "SOLIDWORKS_MCP_CLOSE_DOCUMENTS_AFTER_RUN": config.close_documents_after_run,
             "SOLIDWORKS_MCP_CLEANUP_ATTACH_ONLY": config.cleanup_attach_only,
+            "SOLIDWORKS_MCP_ENABLE_CONSTRUCTION_REFERENCE_DIMENSIONS": (
+                config.enable_construction_reference_dimensions
+            ),
             "SOLIDWORKS_MCP_RUN_ID_SET": bool(config.run_id),
         },
         "extra": sanitize_for_log(extra or {}, Path.home(), context.debug_level),
@@ -239,7 +241,7 @@ def write_artifacts_index(context: DebugRunContext, report_payload: dict[str, An
             base_dir=context.run_dir,
         ),
     }
-    artifact_path = write_json_file(context.artifacts_file, payload)
+    write_json_file(context.artifacts_file, payload)
     payload["fixed_files"]["artifacts"] = _path_entry(context.artifacts_file, base_dir=context.run_dir)
     return write_json_file(context.artifacts_file, payload)
 

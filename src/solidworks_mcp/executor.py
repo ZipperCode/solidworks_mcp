@@ -1246,6 +1246,18 @@ def _build_existing_model_production_acceptance_result(
             if item.get("classification") == "geometry_verified_dimension"
             and item.get("proxy_dimension") is not True
         )
+    required_display_dimensions = _existing_model_required_display_dimensions_for_acceptance(
+        required_dimensions,
+        manufacturing_draft,
+    )
+    prismatic_dimension_evidence_ok = _existing_model_prismatic_dimension_evidence_ok(
+        created_dimension_items,
+        required_dimensions,
+        manufacturing_draft,
+        geometry_result,
+        display_dimension_count,
+        geometry_verified_dimension_count,
+    )
     manufacturing_note_created = (
         metadata_note_result.get("status") == "manufacturing_note_created"
         and manufacturing_note_result.get("status") == "manufacturing_note_created"
@@ -1301,14 +1313,22 @@ def _build_existing_model_production_acceptance_result(
         "basic_dimensions_created": diagnostics.get("drawing_dimension_status") == "basic_dimensions_created"
         and not missing_dimensions
         and int(dimension_result.get("created_dimension_count") or 0) >= len(required_dimensions)
-        and display_dimension_count >= len(required_dimensions),
+        and display_dimension_count >= len(required_display_dimensions),
         "manufacturing_dimensions_created": dimension_result.get("dimension_layout_status")
         == "existing_model_manufacturing_dimensions_created"
-        and geometry_verified_dimension_count >= len(required_dimensions),
+        and (
+            prismatic_dimension_evidence_ok
+            if manufacturing_draft.get("classification") == "imported_prismatic_machining_draft"
+            else geometry_verified_dimension_count >= len(required_dimensions)
+        ),
         "trusted_basic_dimensions": dimension_result.get("dimension_layout_status")
         == "existing_model_manufacturing_dimensions_created"
-        and display_dimension_count >= len(required_dimensions)
-        and geometry_verified_dimension_count >= len(required_dimensions),
+        and display_dimension_count >= len(required_display_dimensions)
+        and (
+            prismatic_dimension_evidence_ok
+            if manufacturing_draft.get("classification") == "imported_prismatic_machining_draft"
+            else geometry_verified_dimension_count >= len(required_dimensions)
+        ),
         "material_verified": required_material is None
         or (
             diagnostics.get("material_status") == "material_verified"
@@ -1380,6 +1400,7 @@ def _build_existing_model_production_acceptance_result(
         "dimension_layout_status": dimension_result.get("dimension_layout_status"),
         "missing_dimensions": missing_dimensions,
         "required_dimensions": sorted(required_dimensions),
+        "required_display_dimensions": sorted(required_display_dimensions),
         "manufacturing_note_status": manufacturing_note_result.get("status"),
         "manufacturing_note_method": manufacturing_note_result.get("method"),
         "model_geometry_status": diagnostics.get("model_geometry_status"),
@@ -1660,6 +1681,19 @@ def _build_existing_model_assembly_acceptance_result(
     }
 
 
+PRISMATIC_OVERALL_DIMENSION_IDS = frozenset({"overall_length", "overall_width", "overall_height"})
+PRISMATIC_REQUIRED_DIMENSION_IDS = frozenset(
+    {
+        "overall_length",
+        "overall_width",
+        "overall_height",
+        "hole_position_x",
+        "hole_position_y",
+        "hole_diameter",
+    }
+)
+
+
 def _existing_model_required_dimensions_for_acceptance(
     dimension_result: dict[str, Any],
     manufacturing_draft: dict[str, Any],
@@ -1674,8 +1708,124 @@ def _existing_model_required_dimensions_for_acceptance(
     if required:
         return required
     if manufacturing_draft.get("classification") == "imported_prismatic_machining_draft":
-        return {"overall_length"}
+        return set(PRISMATIC_REQUIRED_DIMENSION_IDS)
     return {"overall_outer_diameter", "inner_diameter", "overall_length"}
+
+
+def _existing_model_required_display_dimensions_for_acceptance(
+    required_dimensions: set[str],
+    manufacturing_draft: dict[str, Any],
+) -> set[str]:
+    if manufacturing_draft.get("classification") == "imported_prismatic_machining_draft":
+        return required_dimensions - PRISMATIC_OVERALL_DIMENSION_IDS
+    return required_dimensions
+
+
+def _existing_model_prismatic_overall_axis_map(
+    geometry_result: dict[str, Any],
+) -> dict[str, str]:
+    measured = geometry_result.get("measured_dimensions_mm")
+    if not isinstance(measured, dict):
+        return {}
+    axis_dimensions: dict[str, float] = {}
+    for axis in ("x", "y", "z"):
+        try:
+            value = float(measured.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0.0:
+            axis_dimensions[axis] = value
+    if len(axis_dimensions) != 3:
+        return {}
+    height_axis = min(axis_dimensions, key=axis_dimensions.__getitem__)
+    face_axes = [axis for axis in ("x", "y", "z") if axis != height_axis]
+    length_axis = max(face_axes, key=axis_dimensions.__getitem__)
+    width_axis = min(face_axes, key=axis_dimensions.__getitem__)
+    return {
+        "overall_length": length_axis,
+        "overall_width": width_axis,
+        "overall_height": height_axis,
+    }
+
+
+def _existing_model_prismatic_readback_note_matches_geometry(
+    item: dict[str, Any],
+    dimension_id: str,
+    geometry_result: dict[str, Any],
+) -> bool:
+    if geometry_result.get("status") != "geometry_verified":
+        return False
+    measured = geometry_result.get("measured_dimensions_mm")
+    if not isinstance(measured, dict):
+        return False
+    axis_by_id = _existing_model_prismatic_overall_axis_map(geometry_result)
+    axis = axis_by_id.get(dimension_id)
+    if axis is None or item.get("axis") != axis:
+        return False
+    try:
+        measured_value = float(measured.get(axis) or 0.0)
+        note_value = float(item.get("value_mm") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return measured_value > 0.0 and abs(measured_value - note_value) <= 0.01
+
+
+def _existing_model_prismatic_dimension_item_trusted(
+    item: dict[str, Any],
+    dimension_id: str,
+    geometry_result: dict[str, Any],
+) -> bool:
+    if item.get("proxy_dimension") is True:
+        return False
+    if dimension_id in PRISMATIC_OVERALL_DIMENSION_IDS:
+        if item.get("classification") == "geometry_verified_dimension":
+            return item.get("is_display_dimension") is True
+        return (
+            item.get("classification") == "geometry_readback_note"
+            and item.get("annotation_kind") == "imported_prismatic_overall_size_note"
+            and _existing_model_prismatic_readback_note_matches_geometry(item, dimension_id, geometry_result)
+        )
+    return item.get("classification") == "geometry_verified_dimension" and item.get("is_display_dimension") is True
+
+
+def _existing_model_prismatic_dimension_evidence_ok(
+    created_dimension_items: list[dict[str, Any]],
+    required_dimensions: set[str],
+    manufacturing_draft: dict[str, Any],
+    geometry_result: dict[str, Any],
+    display_dimension_count: int,
+    geometry_verified_dimension_count: int,
+) -> bool:
+    if manufacturing_draft.get("classification") != "imported_prismatic_machining_draft":
+        return False
+    created_by_id = {str(item.get("id")): item for item in created_dimension_items if item.get("id")}
+    required_display_dimensions = _existing_model_required_display_dimensions_for_acceptance(
+        required_dimensions,
+        manufacturing_draft,
+    )
+    trusted_geometry_evidence_count = sum(
+        1
+        for dimension_id in required_dimensions
+        if dimension_id in created_by_id
+        and _existing_model_prismatic_dimension_item_trusted(
+            created_by_id[dimension_id],
+            dimension_id,
+            geometry_result,
+        )
+    )
+    return (
+        required_dimensions.issubset(set(created_by_id))
+        and all(
+            _existing_model_prismatic_dimension_item_trusted(
+                created_by_id[dimension_id],
+                dimension_id,
+                geometry_result,
+            )
+            for dimension_id in required_dimensions
+        )
+        and display_dimension_count >= len(required_display_dimensions)
+        and max(geometry_verified_dimension_count, trusted_geometry_evidence_count) >= len(required_dimensions)
+    )
 
 
 def _build_atomic_production_acceptance_result(
@@ -2914,6 +3064,7 @@ def _trusted_workflow_result(plan: ModelPlan) -> dict[str, Any]:
     """Return whether the plan belongs to a controlled production workflow."""
 
     atomic_workflow = _trusted_atomic_workflow_result(plan)
+    existing_model_workflow = _trusted_existing_model_workflow_result(plan)
     for workflow_result in (
         _trusted_bracket_workflow_result(plan),
         _trusted_mounting_plate_workflow_result(plan),
@@ -2929,7 +3080,7 @@ def _trusted_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         _trusted_sleeve_workflow_result(plan),
         _trusted_slotted_array_plate_workflow_result(plan),
         _trusted_bom_assembly_workflow_result(plan),
-        _trusted_existing_model_workflow_result(plan),
+        existing_model_workflow,
         atomic_workflow,
     ):
         if workflow_result["ok"]:
@@ -2938,6 +3089,8 @@ def _trusted_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         return atomic_workflow
 
     operation_names = [operation.op for operation in plan.operations]
+    if "import_existing_model" in operation_names:
+        return existing_model_workflow
     return {
         "ok": False,
         "status": "unsupported_workflow",
@@ -3383,10 +3536,12 @@ def _trusted_existing_model_workflow_result(plan: ModelPlan) -> dict[str, Any]:
     has_required_drawing_exports = {"pdf", "dwg"}.issubset(drawing_outputs)
     native_output = "sldasm" if params and params.get("document_type") == "assembly" else "sldprt"
     has_native_output = native_output in plan.output_formats
+    copies_to_run_dir = params is not None and params.get("copy_to_run_dir") is True
     ok = (
         import_count == 1
         and not untrusted_operations
         and params is not None
+        and copies_to_run_dir
         and has_drawing
         and has_required_drawing_exports
         and has_native_output
@@ -3401,6 +3556,10 @@ def _trusted_existing_model_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         )
     elif params is None:
         failure_reason = "Trusted existing-model drawing acceptance requires valid import_existing_model parameters."
+    elif not copies_to_run_dir:
+        failure_reason = (
+            "Trusted existing-model drawing acceptance requires copy_to_run_dir=true so source CAD files stay immutable."
+        )
     elif not has_drawing:
         failure_reason = "Trusted existing-model drawing acceptance requires drawing_profile.enabled=true."
     elif not has_required_drawing_exports:
@@ -3413,6 +3572,7 @@ def _trusted_existing_model_workflow_result(plan: ModelPlan) -> dict[str, Any]:
         "workflow": "existing_model",
         "existing_model_operation_count": import_count,
         "document_type": params.get("document_type") if params else None,
+        "copy_to_run_dir": params.get("copy_to_run_dir") if params else None,
         "native_output_required": native_output,
         "allowed_operations": sorted(TRUSTED_EXISTING_MODEL_OPERATIONS),
         "operation_sequence": operation_names,

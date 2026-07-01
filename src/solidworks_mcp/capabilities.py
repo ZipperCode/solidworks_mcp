@@ -684,7 +684,7 @@ CAPABILITY_CATALOG: dict[str, Any] = {
                 {
                     "id": "drawing.basic_dimensions",
                     "status": "available",
-                    "purpose": "Create verified SolidWorks display dimensions for the controlled MVP drawings.",
+                    "purpose": "Create verified SolidWorks display dimensions and explicit imported-model readback notes for trusted drawings.",
                     "suggested_inputs": [
                         "front/top drawing views",
                         "controlled workflow parameters",
@@ -694,7 +694,7 @@ CAPABILITY_CATALOG: dict[str, Any] = {
                     "dependencies": ["DrawingDoc.AddHorizontalDimension2", "DrawingDoc.AddVerticalDimension2", "DrawingDoc.AddRadialDimension2", "DrawingDoc.AddDimension2"],
                     "future_adapter_entry": "SolidWorksCOMAdapter._try_insert_basic_dimensions",
                     "references": ["CSharpAndSolidWorks", "solidworks-api"],
-                    "notes": "Trusted smoke requires workflow-specific basic dimensions: mounting-plate length, width, thickness, real selected-edge R5/R6 radial dimensions and hole edge offsets; flange outer diameter, hole diameter and thickness; or center-hole plate length, width, thickness and hole diameter. Successful runs report dimension_layout_status=trusted_dimensions_created; radius_proxy_used remains diagnostic and is rejected by production acceptance.",
+                    "notes": "Trusted smoke requires workflow-specific basic dimensions: mounting-plate length, width, thickness, real selected-edge R5/R6 radial dimensions and hole edge offsets; flange outer diameter, hole diameter and thickness; or center-hole plate length, width, thickness and hole diameter. Imported rotational manufacturing drafts still require OD/ID/L display dimensions. Imported prismatic drafts may satisfy overall length/width/height with classification=geometry_readback_note and annotation_kind=imported_prismatic_overall_size_note from model bounding-box readback only when each note axis/value_mm matches model_geometry_result.measured_dimensions_mm, while hole_position_x, hole_position_y, and hole_diameter remain required SolidWorks display dimensions and are listed through required_display_dimensions. The construction-reference fallback is disabled by default with SOLIDWORKS_MCP_ENABLE_CONSTRUCTION_REFERENCE_DIMENSIONS=0 and reports skipped_hang_guard; enable it only for supervised diagnosis runs. Successful controlled-model runs report dimension_layout_status=trusted_dimensions_created; imported-model runs report dimension_layout_status=existing_model_manufacturing_dimensions_created; radius_proxy_used and proxy_dimension=true remain diagnostic and are rejected by production acceptance.",
                 },
                 {
                     "id": "drawing.hole_callouts",
@@ -998,11 +998,12 @@ CAPABILITY_CATALOG: dict[str, Any] = {
                         "SOLIDWORKS_MCP_PART_TEMPLATE",
                         "SOLIDWORKS_MCP_DRAWING_TEMPLATE",
                         "SOLIDWORKS_MCP_CLOSE_DOCUMENTS_AFTER_RUN",
+                        "SOLIDWORKS_MCP_ENABLE_CONSTRUCTION_REFERENCE_DIMENSIONS",
                     ],
                     "expected_outputs": ["environment snapshot", "config summary"],
                     "dependencies": ["SolidWorksMCPConfig.from_env"],
                     "references": ["SolidworksMCP-TS", "CSharpAndSolidWorks"],
-                    "notes": "environment.json records safe configuration facts for each execution run.",
+                    "notes": "environment.json records safe configuration facts for each execution run, including whether the high-risk construction-reference dimension fallback was enabled.",
                 },
                 {
                     "id": "runtime.close_run_documents",
@@ -1182,7 +1183,7 @@ CAPABILITY_CATALOG: dict[str, Any] = {
                     "expected_outputs": ["production_verdict.status=accepted", "production_acceptance_result.status=accepted", "failures", "repair_actions", "summary"],
                     "dependencies": ["preflight", "HoleWizard/thread fallback status", "model geometry readback", "mass property readback", "standard drawing views", "drawing callouts", "basic dimensions", "material verification when requested", "artifact validation", "artifact content", "cleanup result"],
                     "references": ["solidworks-api"],
-                    "notes": "ExecutionReport.to_dict exposes this as top-level production_verdict and keeps the full production_acceptance_result under diagnostics. Rejected verdicts include repair_actions with stable ids, next_step text, and evidence_fields so clients can route an automatic repair pass instead of only displaying raw failure ids. The summary includes trusted_workflow_status, model geometry and mass-property readback, drawing_view_status, dimension_layout_status, proxy_dimensions, non_radial_radius_dimensions, callout_creation_method, and requested/current material so clients can distinguish trusted outputs from rejected diagnostic fallbacks. Current accepted workflows are controlled_mounting_plate, controlled_center_hole_flange, controlled_center_hole_plate, controlled_bracket, controlled_end_cap, controlled_mounting_block, controlled_shaft, controlled_washer, controlled_sleeve, controlled_slotted_array_plate, and session-produced controlled_atomic_model. Extra direct freeform modeling operations are rejected with trusted_controlled_workflow and, under the default trusted workflow policy, are blocked during preflight before execution.",
+                    "notes": "ExecutionReport.to_dict exposes this as top-level production_verdict and keeps the full production_acceptance_result under diagnostics. Rejected verdicts include repair_actions with stable ids, next_step text, and evidence_fields so clients can route an automatic repair pass instead of only displaying raw failure ids. The summary includes trusted_workflow_status, model geometry and mass-property readback, drawing_view_status, dimension_layout_status, proxy_dimensions, non_radial_radius_dimensions, callout_creation_method, requested/current material, and required_display_dimensions so clients can distinguish trusted outputs from rejected diagnostic fallbacks. Imported prismatic drawings may accept model-bounding-box geometry_readback_note evidence for overall length/width/height only when model_geometry_status=geometry_verified and each readback note axis/value_mm matches model_geometry_result.measured_dimensions_mm; hole_position_x, hole_position_y, and hole_diameter remain required display dimensions and proxy_dimension=true is still rejected. Current accepted workflows are controlled_mounting_plate, controlled_center_hole_flange, controlled_center_hole_plate, controlled_bracket, controlled_end_cap, controlled_mounting_block, controlled_shaft, controlled_washer, controlled_sleeve, controlled_slotted_array_plate, controlled_existing_model_drawing, and session-produced controlled_atomic_model. Extra direct freeform modeling operations are rejected with trusted_controlled_workflow and, under the default trusted workflow policy, are blocked during preflight before execution.",
                 },
                 {
                     "id": "diagnostics.document_state_audit",

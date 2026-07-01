@@ -1936,12 +1936,12 @@ class SolidWorksCOMAdapter(CADAdapter):
         imported_dir = self._require_workspace() / "imported"
         imported_dir.mkdir(parents=True, exist_ok=True)
         run_model_path = imported_dir / source_path.name
-        if bool(params.get("copy_to_run_dir", True)):
-            shutil.copy2(source_path, run_model_path)
-            copied_to_run_dir = True
-        else:
-            run_model_path = source_path
-            copied_to_run_dir = False
+        if not bool(params.get("copy_to_run_dir", True)):
+            raise RuntimeError(
+                "Existing model imports must copy the source into the isolated run directory before opening."
+            )
+        shutil.copy2(source_path, run_model_path)
+        copied_to_run_dir = True
         document_type = str(params.get("document_type") or "part").lower()
         reference_copy_result = (
             _copy_existing_model_reference_files(params, imported_dir, source_path)
@@ -2194,6 +2194,17 @@ class SolidWorksCOMAdapter(CADAdapter):
                 details={"operation": operation.to_dict()},
             )
 
+    def _record_drawing_stage(
+        self,
+        stage: str,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"stage": stage}
+        if details:
+            payload.update(details)
+        self.record_event("drawing.stage", status, payload)
+
     def generate_drawing(self, plan: ModelPlan, profile: DrawingProfile) -> dict[str, str]:
         """Create a drawing document, insert standard views and try hole callouts."""
 
@@ -2201,16 +2212,41 @@ class SolidWorksCOMAdapter(CADAdapter):
         workspace = self._require_workspace() / "exports"
         workspace.mkdir(parents=True, exist_ok=True)
         if not profile.enabled:
+            self._record_drawing_stage("generate_drawing", "skipped", {"reason": "profile_disabled"})
             return {}
 
+        self._record_drawing_stage("new_drawing", "started", {"profile": profile.to_dict()})
         self._drawing = self._new_drawing_document(sw, profile)
 
         if self._drawing is None:
+            self._record_drawing_stage("new_drawing", "failed", {"reason": "document_not_created"})
             raise RuntimeError("SolidWorks did not create a drawing document.")
         self._active_drawing_title = self._document_title(self._drawing)
+        self._record_drawing_stage(
+            "new_drawing",
+            "completed",
+            {"drawing_title": self._active_drawing_title},
+        )
 
+        self._record_drawing_stage("ensure_part_saved", "started")
         part_path = self._ensure_part_saved(plan)
         existing_model = existing_model_parameters_from_plan(plan)
+        self._record_drawing_stage(
+            "ensure_part_saved",
+            "completed",
+            {"part_path": path_to_string(part_path)},
+        )
+        existing_model_type = None
+        if existing_model is not None:
+            existing_model_type = str(existing_model.get("document_type") or "part")
+        self._record_drawing_stage(
+            "create_views",
+            "started",
+            {
+                "existing_model_type": existing_model_type,
+                "view_style": profile.view_style,
+            },
+        )
         if existing_model is not None and existing_model.get("document_type") == "assembly":
             view_result = self._create_existing_model_assembly_drawing_views(
                 part_path,
@@ -2225,7 +2261,41 @@ class SolidWorksCOMAdapter(CADAdapter):
             )
         else:
             view_result = self._create_standard_drawing_views(part_path, plan, profile)
+        self._record_drawing_stage(
+            "create_views",
+            "completed",
+            {
+                "existing_model_type": existing_model_type,
+                "status": view_result.get("status"),
+                "view_roles": [
+                    str(view.get("role"))
+                    for view in view_result.get("views", [])
+                    if isinstance(view, dict) and view.get("role")
+                ],
+            },
+        )
+        self._record_drawing_stage(
+            "insert_basic_dimensions",
+            "started",
+            {"existing_model_type": existing_model_type},
+        )
         dimension_result = self._try_insert_basic_dimensions(plan, view_result, profile)
+        self._record_drawing_stage(
+            "insert_basic_dimensions",
+            "completed",
+            {
+                "status": dimension_result.get("status"),
+                "created_dimension_count": dimension_result.get("created_dimension_count"),
+                "missing_dimensions": dimension_result.get("missing_dimensions"),
+                "overall_dimension_spec_count": dimension_result.get("overall_dimension_spec_count"),
+                "construction_dimension_spec_count": dimension_result.get("construction_dimension_spec_count"),
+            },
+        )
+        self._record_drawing_stage(
+            "hole_callout",
+            "started",
+            {"existing_model_type": existing_model_type},
+        )
         if _is_bom_assembly_plan(plan):
             callout_result = {
                 "status": "not_requested",
@@ -2282,13 +2352,38 @@ class SolidWorksCOMAdapter(CADAdapter):
             self.record_event("drawing.hole_callout", "skipped", callout_result)
         else:
             callout_result = self._try_insert_thread_callouts(plan, view_result)
+        self._record_drawing_stage(
+            "hole_callout",
+            "skipped" if callout_result.get("status") == "not_requested" else "completed",
+            {
+                "status": callout_result.get("status"),
+                "created_callout_count": callout_result.get("created_callout_count"),
+                "reason": callout_result.get("reason"),
+            },
+        )
+        self._record_drawing_stage("metadata_note", "started")
         metadata_note_result = self._try_insert_metadata_note(plan)
+        self._record_drawing_stage(
+            "metadata_note",
+            "completed",
+            {"status": metadata_note_result.get("status")},
+        )
         if existing_model is not None:
+            self._record_drawing_stage(
+                "manufacturing_note",
+                "started",
+                {"existing_model_type": existing_model_type},
+            )
             manufacturing_note_result = self._try_insert_existing_model_manufacturing_note(
                 plan,
                 view_result,
                 dimension_result,
                 profile,
+            )
+            self._record_drawing_stage(
+                "manufacturing_note",
+                "completed",
+                {"status": manufacturing_note_result.get("status")},
             )
             metadata_note_result = {
                 "status": (
@@ -2305,6 +2400,9 @@ class SolidWorksCOMAdapter(CADAdapter):
             if dimension_event_status == "failed":
                 self._warnings.append(f"drawing_basic_dimensions:{dimension_result.get('status')}")
             self.record_event("drawing.basic_dimensions", dimension_event_status, dimension_result)
+        else:
+            self._record_drawing_stage("manufacturing_note", "skipped", {"reason": "not_existing_model"})
+        self._record_drawing_stage("recipe_note", "started")
         recipe_contract = drawing_recipe_contract(plan)
         recipe_note_result = self._try_insert_drawing_recipe_note(recipe_contract, view_result)
         self._drawing_recipe_result = {
@@ -2315,6 +2413,11 @@ class SolidWorksCOMAdapter(CADAdapter):
             "note_result": recipe_note_result,
         }
         self.record_event("drawing.recipe_contract", "completed", self._drawing_recipe_result)
+        self._record_drawing_stage(
+            "recipe_note",
+            "completed",
+            {"status": recipe_note_result.get("status")},
+        )
         view_status = str(view_result.get("status", "failed"))
         dimension_status = str(dimension_result.get("status", "not_requested"))
         callout_status = str(callout_result.get("status", "hole_callout_failed"))
@@ -2333,8 +2436,15 @@ class SolidWorksCOMAdapter(CADAdapter):
             self._warnings.append(f"drawing_thread_callouts:{callout_status}")
 
         drawing_path = workspace / f"{safe_output_name(plan.name)}.slddrw"
+        self._record_drawing_stage("save_drawing", "started", {"path": path_to_string(drawing_path)})
         self._save_as(self._drawing, drawing_path)
+        self._record_drawing_stage("save_drawing", "completed", {"path": path_to_string(drawing_path)})
         drawing_manifest_path = workspace / f"{safe_output_name(plan.name)}.drawing.json"
+        self._record_drawing_stage(
+            "write_drawing_manifest",
+            "started",
+            {"path": path_to_string(drawing_manifest_path)},
+        )
         drawing_manifest_path.write_text(
             json.dumps(
                 {
@@ -2357,6 +2467,11 @@ class SolidWorksCOMAdapter(CADAdapter):
                 indent=2,
             ),
             encoding="utf-8",
+        )
+        self._record_drawing_stage(
+            "write_drawing_manifest",
+            "completed",
+            {"path": path_to_string(drawing_manifest_path)},
         )
         self._active_drawing_path = drawing_path
         self._active_drawing_title = self._document_title(self._drawing) or drawing_path.name
@@ -7945,6 +8060,10 @@ class SolidWorksCOMAdapter(CADAdapter):
 
         # ── Detect sheet metal ──
         is_sheet_metal = self._detect_sheet_metal_model()
+        geometry_profile = layout.get("existing_model_geometry_profile")
+        if not isinstance(geometry_profile, dict):
+            geometry_profile = _existing_model_geometry_profile(layout.get("model_dimensions_m"))
+        is_prismatic = geometry_profile.get("kind") == "prismatic"
         if is_sheet_metal:
             layout["is_sheet_metal"] = True
             # Add flat pattern slot if not already present
@@ -7983,6 +8102,32 @@ class SolidWorksCOMAdapter(CADAdapter):
             views.append(end_view["summary"])
         else:
             errors.extend(end_view.get("errors", []))
+
+        hole_face_result: dict[str, Any] = {"status": "not_requested", "reason": "non_prismatic_imported_model"}
+        if is_prismatic and not is_sheet_metal:
+            hole_face_names = tuple(
+                str(name)
+                for name in layout.get(
+                    "hole_face_view_names",
+                    _existing_model_prismatic_hole_face_view_names(layout.get("model_dimensions_m")),
+                )
+                if str(name)
+            )
+            hole_face_result = self._create_named_drawing_view(
+                drawing,
+                part_path,
+                "hole_face",
+                hole_face_names or ("*Top", "*上视", "*Front", "*前视", "*Right", "*右视"),
+                layout["slots"].get("hole_face", layout["slots"]["end"]),
+                float(layout.get("scale") or 1.0),
+            )
+            if hole_face_result.get("view") is not None:
+                self._drawing_view_handles["hole_face"] = hole_face_result["view"]
+                views.append(hole_face_result["summary"])
+            else:
+                hole_face_result["status"] = "hole_face_view_failed"
+                hole_face_result["errors"] = hole_face_result.get("errors", [])
+                errors.extend(hole_face_result.get("errors", []))
 
         section_result = self._try_create_existing_model_section_view(
             drawing,
@@ -8035,6 +8180,8 @@ class SolidWorksCOMAdapter(CADAdapter):
         center_mark_result = self._try_auto_insert_center_marks(drawing, layout, is_sheet_metal)
 
         required_roles = ["section", "end", "isometric"]
+        if is_prismatic and not is_sheet_metal:
+            required_roles.append("hole_face")
         if is_sheet_metal and flat_pattern_result.get("view") is not None:
             required_roles.append("flat_pattern")
         created_roles = {str(view.get("role")) for view in views if view.get("role")}
@@ -8043,9 +8190,6 @@ class SolidWorksCOMAdapter(CADAdapter):
         layout["fit_adjustment_result"] = fit_adjustment_result
         layout_result = self._verify_standard_drawing_layout(layout, views)
         layout.update(layout_result)
-        geometry_profile = layout.get("existing_model_geometry_profile")
-        if not isinstance(geometry_profile, dict):
-            geometry_profile = _existing_model_geometry_profile(layout.get("model_dimensions_m"))
         is_rotational = geometry_profile.get("kind") == "rotational"
         axis_result = (
             _existing_model_rotational_axis_result(layout)
@@ -8108,6 +8252,11 @@ class SolidWorksCOMAdapter(CADAdapter):
             "center_mark": center_mark_rotational_result,
             "is_sheet_metal": is_sheet_metal,
             "flat_pattern": _drawing_view_result_payload(flat_pattern_result) if is_sheet_metal else None,
+            "hole_face": (
+                _drawing_view_result_payload(hole_face_result)
+                if is_prismatic and not is_sheet_metal
+                else None
+            ),
         }
         status = "created" if not missing_roles else f"partial:{len(views)}/{len(required_roles)}"
         return {
@@ -8234,20 +8383,29 @@ class SolidWorksCOMAdapter(CADAdapter):
         z_dim = max(float(dimensions.get("z") or 0.0), 0.001)
         diameter_dim = max(x_dim, z_dim, 0.001)
         axial_dim = max(min(x_dim, y_dim, z_dim), 0.001)
+        is_prismatic = geometry_profile.get("kind") == "prismatic"
+        hole_face_dimensions = _existing_model_prismatic_hole_face_dimensions(dimensions)
         safe_width = safe_right - safe_left
         safe_height = safe_top - safe_bottom
         main_width = safe_width * 0.58
         side_width = safe_width * 0.30
         main_height = safe_height * 0.68
-        raw_scale = min(
-            main_width / max(diameter_dim, 0.001),
-            main_height / max(max(axial_dim, diameter_dim * 0.45), 0.001),
-        ) * 0.62
-        target_scale = min(max(raw_scale, 0.02), 2.00)
+        if is_prismatic:
+            raw_scale = min(
+                main_width / max(float(hole_face_dimensions["width_m"]), 0.001),
+                main_height / max(float(hole_face_dimensions["height_m"]), 0.001),
+            ) * 0.62
+        else:
+            raw_scale = min(
+                main_width / max(diameter_dim, 0.001),
+                main_height / max(max(axial_dim, diameter_dim * 0.45), 0.001),
+            ) * 0.62
+        target_scale = min(max(raw_scale, 0.02), 1.00 if is_prismatic else 2.00)
         isometric_scale = min(max(target_scale * 0.40, 0.02), 1.00)
 
         section_x = safe_left + main_width * 0.46
-        section_y = safe_bottom + safe_height * 0.63
+        section_y = safe_bottom + safe_height * (0.76 if is_prismatic else 0.63)
+        hole_face_y = safe_bottom + safe_height * 0.36
         source_x = safe_left + main_width + side_width * 0.54
         end_x = source_x
         end_y = safe_bottom + safe_height * 0.68
@@ -8283,10 +8441,22 @@ class SolidWorksCOMAdapter(CADAdapter):
                 "y": safe_bottom + 0.010,
             },
         }
+        if is_prismatic:
+            slots["hole_face"] = {
+                "x": section_x,
+                "y": hole_face_y,
+                "width_m": float(hole_face_dimensions["width_m"]),
+                "height_m": float(hole_face_dimensions["height_m"]),
+            }
         return {
             "status": "planned",
             "auto_layout": True,
             "layout_style": "manufacturing_rotational",
+            "layout_substyle": (
+                "manufacturing_prismatic_hole_face"
+                if is_prismatic
+                else "manufacturing_rotational_section"
+            ),
             "projection": "first_angle",
             "sheet_size_m": {"width": sheet_width_m, "height": sheet_height_m},
             "safe_rect_m": {
@@ -8303,6 +8473,12 @@ class SolidWorksCOMAdapter(CADAdapter):
             "model_dimensions_m": dimensions,
             "model_dimensions_mm": {key: round(value * 1000.0, 3) for key, value in dimensions.items()},
             "existing_model_geometry_profile": geometry_profile,
+            "hole_face_view_names": (
+                _existing_model_prismatic_hole_face_view_names(dimensions)
+                if is_prismatic
+                else []
+            ),
+            "hole_face_dimensions": hole_face_dimensions if is_prismatic else None,
             "slots": slots,
             "plan_name": plan.name,
         }
@@ -9275,6 +9451,11 @@ class SolidWorksCOMAdapter(CADAdapter):
             method = _get_com_member(drawing, "InsertModelAnnotations3")
             if callable(method):
                 for all_views_flag in (False, True):
+                    self._record_drawing_stage(
+                        "import_model_dimensions",
+                        "started",
+                        {"method": "InsertModelAnnotations3", "all_views": all_views_flag},
+                    )
                     started_at = perf_counter()
                     try:
                         method(0, SW_INSERT_DIMENSIONS, all_views_flag, False, False, True)
@@ -9282,12 +9463,22 @@ class SolidWorksCOMAdapter(CADAdapter):
                             {"types": SW_INSERT_DIMENSIONS, "all_views": all_views_flag,
                              "purpose": "existing_model_dimensions"},
                             result=True, started_at=started_at)
+                        self._record_drawing_stage(
+                            "import_model_dimensions",
+                            "completed",
+                            {"method": "InsertModelAnnotations3", "all_views": all_views_flag},
+                        )
                         import_ok = True
                         import_attempts.append({"all_views": all_views_flag, "ok": True})
                     except Exception as exc:
                         self.record_com_call("DrawingDoc.InsertModelAnnotations3",
                             {"types": SW_INSERT_DIMENSIONS, "all_views": all_views_flag},
                             error=exc, started_at=started_at)
+                        self._record_drawing_stage(
+                            "import_model_dimensions",
+                            "failed",
+                            {"method": "InsertModelAnnotations3", "all_views": all_views_flag, "error": str(exc)},
+                        )
                         import_attempts.append({"all_views": all_views_flag, "error": str(exc)[:100]})
             result["import_model_dimensions_result"] = {
                 "status": "completed_unverified" if import_ok else "failed",
@@ -9318,17 +9509,52 @@ class SolidWorksCOMAdapter(CADAdapter):
         )
         specs = _existing_model_overall_dimension_specs(self._drawing_view_handles, view_result)
         result["overall_dimension_spec_count"] = len(specs)
-        for spec in specs:
+        self._record_drawing_stage(
+            "manual_dimension_specs",
+            "started",
+            {"spec_count": len(specs), "required_dimensions": required_dimensions},
+        )
+        for spec_index, spec in enumerate(specs):
+            dimension_id = str(spec["id"])
+            if dimension_id in created_by_id:
+                continue
+            self._record_drawing_stage(
+                "manual_dimension_spec",
+                "started",
+                {
+                    "index": spec_index,
+                    "id": dimension_id,
+                    "view_role": spec.get("view_role"),
+                    "method": spec.get("method"),
+                    "edge_selector": spec.get("edge_selector"),
+                },
+            )
             attempt = self._try_create_basic_dimension_from_spec(drawing, spec)
             result["attempts"].append(attempt)
+            self._record_drawing_stage(
+                "manual_dimension_spec",
+                "completed" if attempt.get("created") else "not_created",
+                {
+                    "index": spec_index,
+                    "id": dimension_id,
+                    "method": attempt.get("method"),
+                    "created": attempt.get("created") is True,
+                    "failure_reason": attempt.get("failure_reason"),
+                },
+            )
             if attempt.get("created"):
-                created_by_id[str(spec["id"])] = {
-                    "id": str(spec["id"]),
+                created_by_id[dimension_id] = {
+                    "id": dimension_id,
                     "method": str(attempt.get("method")),
                     "is_display_dimension": attempt.get("is_display_dimension") is not False,
                     "classification": "geometry_verified_dimension",
                     "proxy_dimension": attempt.get("proxy_dimension") is True,
                 }
+        self._record_drawing_stage(
+            "manual_dimension_specs",
+            "completed",
+            {"created_dimension_ids": sorted(created_by_id)},
+        )
 
         result["created_dimensions"] = [
             created_by_id[dimension_id]
@@ -9376,26 +9602,110 @@ class SolidWorksCOMAdapter(CADAdapter):
                         if item.get("classification") in {"geometry_verified_dimension", "geometry_readback_note"}
                     ]
                 )
+        if not is_assembly_drawing and geo.get("kind") == "prismatic" and result["missing_dimensions"]:
+            note_items = _existing_model_prismatic_note_dimension_items(
+                result["missing_dimensions"],
+                view_result,
+            )
+            for note_item in note_items:
+                created_by_id[str(note_item["id"])] = note_item
+            if note_items:
+                self._record_drawing_stage(
+                    "geometry_readback_dimension_notes",
+                    "completed",
+                    {"created_dimension_ids": [str(item["id"]) for item in note_items]},
+                )
+                result["created_dimensions"] = [
+                    created_by_id[dimension_id]
+                    for dimension_id in required_dimensions
+                    if dimension_id in created_by_id
+                ]
+                result["created_dimension_count"] = len(result["created_dimensions"])
+                result["missing_dimensions"] = [
+                    dimension_id
+                    for dimension_id in required_dimensions
+                    if dimension_id not in created_by_id
+                ]
+                result["display_dimension_count"] = _display_dimension_count(result["created_dimensions"])
+                result["geometry_verified_dimension_count"] = len(
+                    [
+                        item
+                        for item in result["created_dimensions"]
+                        if item.get("classification") in {"geometry_verified_dimension", "geometry_readback_note"}
+                    ]
+                )
         if not result["missing_dimensions"]:
             result["status"] = "basic_dimensions_created"
             result["dimension_layout_status"] = completed_layout_status
             self.record_event("drawing.basic_dimensions", "completed", result)
             return result
 
-        sketch_specs: list[dict[str, Any]] = []
+        sketch_specs = _existing_model_bbox_sketch_dimension_specs(view_result)
         result["construction_dimension_spec_count"] = len(sketch_specs)
-        for spec in sketch_specs:
-            if str(spec["id"]) in created_by_id:
-                continue
-            attempt = self._try_create_existing_model_construction_dimension(drawing, spec)
-            result["attempts"].append(attempt)
-            if attempt.get("created"):
-                created_by_id[str(spec["id"])] = {
-                    "id": str(spec["id"]),
-                    "method": str(attempt.get("method")),
-                    "is_display_dimension": attempt.get("is_display_dimension") is not False,
-                    "construction_reference_dimension": True,
-                }
+        construction_enabled = bool(
+            getattr(
+                getattr(self, "_config", None),
+                "enable_construction_reference_dimensions",
+                False,
+            )
+        )
+        if not construction_enabled:
+            result["construction_dimension_fallback_status"] = "skipped_hang_guard"
+            self._warnings.append("drawing_construction_dimensions:skipped_hang_guard")
+            self._record_drawing_stage(
+                "construction_dimension_specs",
+                "skipped",
+                {
+                    "spec_count": len(sketch_specs),
+                    "missing_dimensions": result["missing_dimensions"],
+                    "reason": "construction_reference_add_dimension_hang_guard",
+                },
+            )
+        else:
+            self._record_drawing_stage(
+                "construction_dimension_specs",
+                "started",
+                {"spec_count": len(sketch_specs), "missing_dimensions": result["missing_dimensions"]},
+            )
+            for spec_index, spec in enumerate(sketch_specs):
+                dimension_id = str(spec["id"])
+                if dimension_id in created_by_id:
+                    continue
+                self._record_drawing_stage(
+                    "construction_dimension_spec",
+                    "started",
+                    {
+                        "index": spec_index,
+                        "id": dimension_id,
+                        "view_role": spec.get("view_role"),
+                        "method": spec.get("method"),
+                    },
+                )
+                attempt = self._try_create_existing_model_construction_dimension(drawing, spec)
+                result["attempts"].append(attempt)
+                self._record_drawing_stage(
+                    "construction_dimension_spec",
+                    "completed" if attempt.get("created") else "not_created",
+                    {
+                        "index": spec_index,
+                        "id": dimension_id,
+                        "method": attempt.get("method"),
+                        "created": attempt.get("created") is True,
+                        "failure_reason": attempt.get("failure_reason"),
+                    },
+                )
+                if attempt.get("created"):
+                    created_by_id[dimension_id] = {
+                        "id": dimension_id,
+                        "method": str(attempt.get("method")),
+                        "is_display_dimension": attempt.get("is_display_dimension") is not False,
+                        "construction_reference_dimension": True,
+                    }
+            self._record_drawing_stage(
+                "construction_dimension_specs",
+                "completed",
+                {"created_dimension_ids": sorted(created_by_id)},
+            )
 
         result["created_dimensions"] = [
             created_by_id[dimension_id]
@@ -9431,7 +9741,7 @@ class SolidWorksCOMAdapter(CADAdapter):
         return result
 
     def _try_create_existing_model_construction_dimension(self, drawing: Any, spec: dict[str, Any]) -> dict[str, Any]:
-        """Create a real DisplayDimension from short drawing sketch reference lines."""
+        """Create a real DisplayDimension from short drawing reference lines."""
 
         attempt: dict[str, Any] = {
             "id": spec["id"],
@@ -9445,82 +9755,231 @@ class SolidWorksCOMAdapter(CADAdapter):
         if spec.get("scale_is_trusted") is not True:
             attempt["failure_reason"] = "Construction reference dimensions require a 1:1 drawing view scale."
             return attempt
+
+        line_creator_specs: list[tuple[str, Any]] = []
+        create_line2 = _get_com_member(drawing, "CreateLine2")
+        if callable(create_line2):
+            line_creator_specs.append(("ModelDoc2.CreateLine2", create_line2))
         sketch = getattr(drawing, "SketchManager", None)
-        if sketch is None:
-            attempt["failure_reason"] = "Drawing SketchManager is not available."
+        if sketch is not None:
+            for method_name in ("CreateLine", "CreateCenterLine"):
+                method = getattr(sketch, method_name, None)
+                if callable(method):
+                    line_creator_specs.append((f"SketchManager.{method_name}", method))
+        if not line_creator_specs:
+            attempt["failure_reason"] = "No SolidWorks line creation API is available for construction references."
             return attempt
 
-        import pythoncom
-        import win32com.client
-
-        self._clear_drawing_selection()
-        null_dispatch = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        opened_sketch = False
+        null_dispatch = None
         try:
-            insert_sketch = getattr(sketch, "InsertSketch", None)
-            if callable(insert_sketch):
-                started_at = perf_counter()
-                opened_sketch = bool(insert_sketch(True))
-                self.record_com_call(
-                    "SketchManager.InsertSketch",
-                    {"purpose": "existing_model_construction_dimension", "id": spec["id"], "open": True},
-                    result=opened_sketch,
-                    started_at=started_at,
-                )
+            import pythoncom
+            import win32com.client
+
+            null_dispatch = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        except ImportError:
+            null_dispatch = None
+
+        self._record_drawing_stage("construction_clear_selection", "started", {"id": spec["id"]})
+        self._clear_drawing_selection()
+        self._record_drawing_stage("construction_clear_selection", "completed", {"id": spec["id"]})
+        try:
             segments = []
-            for line in spec.get("lines", []):
+            for line_index, line in enumerate(spec.get("lines", [])):
                 start = line["start"]
                 end = line["end"]
-                started_at = perf_counter()
-                segment = sketch.CreateLine(float(start[0]), float(start[1]), 0.0, float(end[0]), float(end[1]), 0.0)
-                self.record_com_call(
-                    "SketchManager.CreateLine",
-                    {"purpose": "existing_model_construction_dimension", "id": spec["id"], "start": start, "end": end},
-                    result=segment,
-                    started_at=started_at,
-                )
+                segment = None
+                for method_name, method in line_creator_specs:
+                    self._record_drawing_stage(
+                        "construction_line_create",
+                        "started",
+                        {"id": spec["id"], "index": line_index, "method": method_name},
+                    )
+                    started_at = perf_counter()
+                    try:
+                        segment = method(float(start[0]), float(start[1]), 0.0, float(end[0]), float(end[1]), 0.0)
+                        self.record_com_call(
+                            method_name,
+                            {
+                                "purpose": "existing_model_construction_dimension",
+                                "id": spec["id"],
+                                "start": start,
+                                "end": end,
+                            },
+                            result=segment,
+                            started_at=started_at,
+                        )
+                        self._record_drawing_stage(
+                            "construction_line_create",
+                            "completed",
+                            {
+                                "id": spec["id"],
+                                "index": line_index,
+                                "method": method_name,
+                                "created": segment is not None,
+                            },
+                        )
+                    except Exception as exc:
+                        self.record_com_call(
+                            method_name,
+                            {
+                                "purpose": "existing_model_construction_dimension",
+                                "id": spec["id"],
+                                "start": start,
+                                "end": end,
+                            },
+                            error=exc,
+                            started_at=started_at,
+                        )
+                        self._record_drawing_stage(
+                            "construction_line_create",
+                            "recoverable_failed",
+                            {"id": spec["id"], "index": line_index, "method": method_name, "error": str(exc)},
+                        )
+                    if segment is not None:
+                        attempt.setdefault("line_creation_methods", []).append(method_name)
+                        break
                 if segment is not None:
                     _set_sketch_segment_construction(segment)
                     segments.append(segment)
             attempt["line_count"] = len(segments)
             for index, segment in enumerate(segments[:2]):
-                started_at = perf_counter()
-                try:
-                    selected = segment.Select4(index > 0, null_dispatch)
-                    self.record_com_call(
-                        "SketchSegment.Select4",
-                        {"purpose": "existing_model_construction_dimension", "id": spec["id"], "append": index > 0},
-                        result=selected,
-                        started_at=started_at,
+                selected = False
+                if null_dispatch is not None:
+                    self._record_drawing_stage(
+                        "construction_segment_select",
+                        "started",
+                        {
+                            "id": spec["id"],
+                            "index": index,
+                            "method": "SketchSegment.Select4",
+                            "append": index > 0,
+                        },
                     )
-                except Exception as exc:
-                    self.record_com_call(
-                        "SketchSegment.Select4",
-                        {"purpose": "existing_model_construction_dimension", "id": spec["id"], "append": index > 0},
-                        error=exc,
-                        started_at=started_at,
-                    )
-                    selected = False
+                    started_at = perf_counter()
+                    try:
+                        selected = bool(segment.Select4(index > 0, null_dispatch))
+                        self.record_com_call(
+                            "SketchSegment.Select4",
+                            {
+                                "purpose": "existing_model_construction_dimension",
+                                "id": spec["id"],
+                                "append": index > 0,
+                            },
+                            result=selected,
+                            started_at=started_at,
+                        )
+                        self._record_drawing_stage(
+                            "construction_segment_select",
+                            "completed",
+                            {
+                                "id": spec["id"],
+                                "index": index,
+                                "method": "SketchSegment.Select4",
+                                "selected": selected,
+                            },
+                        )
+                    except Exception as exc:
+                        self.record_com_call(
+                            "SketchSegment.Select4",
+                            {
+                                "purpose": "existing_model_construction_dimension",
+                                "id": spec["id"],
+                                "append": index > 0,
+                            },
+                            error=exc,
+                            started_at=started_at,
+                        )
+                        self._record_drawing_stage(
+                            "construction_segment_select",
+                            "recoverable_failed",
+                            {"id": spec["id"], "index": index, "method": "SketchSegment.Select4", "error": str(exc)},
+                        )
+                if not selected:
+                    for select_method_name, args in (("Select2", (index > 0, 0)), ("Select", (index > 0,))):
+                        select_method = getattr(segment, select_method_name, None)
+                        if not callable(select_method):
+                            continue
+                        self._record_drawing_stage(
+                            "construction_segment_select",
+                            "started",
+                            {
+                                "id": spec["id"],
+                                "index": index,
+                                "method": f"SketchSegment.{select_method_name}",
+                                "append": index > 0,
+                            },
+                        )
+                        started_at = perf_counter()
+                        try:
+                            selected = bool(select_method(*args))
+                            self.record_com_call(
+                                f"SketchSegment.{select_method_name}",
+                                {
+                                    "purpose": "existing_model_construction_dimension",
+                                    "id": spec["id"],
+                                    "append": index > 0,
+                                },
+                                result=selected,
+                                started_at=started_at,
+                            )
+                            self._record_drawing_stage(
+                                "construction_segment_select",
+                                "completed",
+                                {
+                                    "id": spec["id"],
+                                    "index": index,
+                                    "method": f"SketchSegment.{select_method_name}",
+                                    "selected": selected,
+                                },
+                            )
+                        except Exception as exc:
+                            self.record_com_call(
+                                f"SketchSegment.{select_method_name}",
+                                {
+                                    "purpose": "existing_model_construction_dimension",
+                                    "id": spec["id"],
+                                    "append": index > 0,
+                                },
+                                error=exc,
+                                started_at=started_at,
+                            )
+                            self._record_drawing_stage(
+                                "construction_segment_select",
+                                "recoverable_failed",
+                                {
+                                    "id": spec["id"],
+                                    "index": index,
+                                    "method": f"SketchSegment.{select_method_name}",
+                                    "error": str(exc),
+                                },
+                            )
+                        if selected:
+                            break
                 if selected:
                     attempt["selected_count"] += 1
             if attempt["selected_count"] < 2:
                 attempt["failure_reason"] = "Could not select both construction reference lines."
                 return attempt
+            self._record_drawing_stage(
+                "construction_add_dimension",
+                "started",
+                {"id": spec["id"], "method": spec["method"]},
+            )
             dimension = self._add_basic_dimension(drawing, spec, attempt)
             is_display_dimension = _is_display_dimension(dimension)
             attempt["is_display_dimension"] = is_display_dimension
             attempt["created"] = dimension is not None and dimension is not False and is_display_dimension is not False
+            self._record_drawing_stage(
+                "construction_add_dimension",
+                "completed" if attempt["created"] else "not_created",
+                {"id": spec["id"], "method": attempt.get("method"), "created": attempt["created"]},
+            )
             if attempt["created"]:
                 attempt["method"] = str(attempt.get("method") or spec["method"])
                 return attempt
             attempt["failure_reason"] = "Dimension API did not return a verified display dimension for construction references."
             return attempt
         finally:
-            if opened_sketch:
-                try:
-                    sketch.InsertSketch(True)
-                except Exception:
-                    pass
             self._clear_drawing_selection()
 
     def _try_insert_existing_model_drawing_note(
@@ -10707,6 +11166,51 @@ class SolidWorksCOMAdapter(CADAdapter):
             attempt["selected_count"] = len(selected_edges)
             return True
 
+        if selector == "hole_edge":
+            edge_result = self._visible_dimension_edges_for_view(view)
+            attempt["visible_edge_count"] = edge_result["visible_edge_count"]
+            attempt["edge_samples"] = edge_result["edge_samples"]
+            selector_data = spec.get("edge_selector_data", {})
+            role = str(selector_data.get("role", "")) if isinstance(selector_data, dict) else ""
+            if role in {"hole_position_x", "hole_position_y"}:
+                candidates = _best_existing_model_hole_position_edges(edge_result["edges"], spec)
+                if candidates is None:
+                    attempt["failure_reason"] = "No matching imported-model hole position edge pair could be selected."
+                    return False
+                selected_edges = []
+                self._clear_drawing_selection()
+                for edge_index, candidate in enumerate(candidates):
+                    selected = self._select_drawing_view_entity(view, candidate["edge"], append=edge_index > 0)
+                    selected_edges.append({**candidate["summary"], "selected": selected})
+                    if not selected:
+                        attempt["selected_edges"] = selected_edges
+                        return False
+                attempt["selected_edges"] = selected_edges
+                attempt["selected_count"] = len(selected_edges)
+                return True
+
+            candidate = _best_existing_model_hole_circle_edge(edge_result["edges"], spec)
+            if candidate is None:
+                attempt["failure_reason"] = "No matching imported-model circular hole edge could be selected."
+                return False
+            attempt["selected_edge"] = candidate["summary"]
+            selected = self._select_drawing_view_entity(view, candidate["edge"])
+            attempt["selected_count"] = 1 if selected else 0
+            return selected
+
+        if selector == "fillet_edge":
+            edge_result = self._visible_dimension_edges_for_view(view)
+            attempt["visible_edge_count"] = edge_result["visible_edge_count"]
+            attempt["edge_samples"] = edge_result["edge_samples"]
+            candidate = _best_existing_model_fillet_arc_edge(edge_result["edges"], spec)
+            if candidate is None:
+                attempt["failure_reason"] = "No matching imported-model fillet or chamfer arc edge could be selected."
+                return False
+            attempt["selected_edge"] = candidate["summary"]
+            selected = self._select_drawing_view_entity(view, candidate["edge"])
+            attempt["selected_count"] = 1 if selected else 0
+            return selected
+
         if selector != "mounting_plate_corner_radius":
             attempt["failure_reason"] = f"Unsupported edge selector: {selector}"
             return False
@@ -10727,15 +11231,40 @@ class SolidWorksCOMAdapter(CADAdapter):
         components = self._get_visible_components(view)
         edges: list[Any] = []
         samples: list[dict[str, Any]] = []
-        visible_edge_count = 0
+        entity_edge_count = 0
+        seen_edge_ids: set[int] = set()
         for component in components or [None]:
             component_edges = self._get_visible_entities(view, component, SW_VIEW_ENTITY_EDGE)
-            visible_edge_count += len(component_edges)
+            entity_edge_count += len(component_edges)
             for edge in component_edges:
+                edge_id = id(edge)
+                if edge_id in seen_edge_ids:
+                    continue
+                seen_edge_ids.add(edge_id)
                 edges.append(edge)
                 if len(samples) < 12:
                     samples.append(_edge_curve_probe(edge))
-        return {"visible_edge_count": visible_edge_count, "edges": edges, "edge_samples": samples}
+        polyline_result = self._get_polyline_edges(view)
+        polyline_edges = polyline_result.get("edges", []) if isinstance(polyline_result, dict) else []
+        for edge in polyline_edges:
+            edge_id = id(edge)
+            if edge_id in seen_edge_ids:
+                continue
+            seen_edge_ids.add(edge_id)
+            edges.append(edge)
+            if len(samples) < 12:
+                samples.append(_edge_curve_probe(edge))
+        return {
+            "visible_edge_count": len(edges),
+            "entity_edge_count": entity_edge_count,
+            "polyline_edge_count": len(polyline_edges),
+            "polyline_numeric_count": polyline_result.get("polyline_numeric_count")
+            if isinstance(polyline_result, dict)
+            else None,
+            "polyline_error": polyline_result.get("error") if isinstance(polyline_result, dict) else None,
+            "edges": edges,
+            "edge_samples": samples,
+        }
 
     def _add_specific_dimension(
         self,
@@ -13558,6 +14087,151 @@ def _best_existing_model_inner_circle_edge(edges: list[Any], spec: dict[str, Any
     return {"edge": best["edge"], "summary": best["summary"]}
 
 
+def _existing_model_hole_circle_edge_candidates(edges: list[Any], role: str) -> list[dict[str, Any]]:
+    """Return selectable full-circle edges, tolerating pywin32 radius readback noise."""
+
+    candidates: list[dict[str, Any]] = []
+    for edge in edges:
+        arc = _arc_summary_from_curve_params(_edge_curve_params(edge))
+        if arc is None or arc.get("is_arc"):
+            continue
+        radius = float(arc.get("radius") or 0.0)
+        center = arc["center"]
+        center_distance = _point_distance(center, (0.0, 0.0, 0.0))
+        radius_status = "measured" if radius > 0 else "unknown"
+        candidates.append(
+            {
+                "edge": edge,
+                "radius": radius,
+                "radius_status": radius_status,
+                "center": center,
+                "center_distance": center_distance,
+                "summary": {
+                    "role": role,
+                    "center": list(center),
+                    "radius": radius,
+                    "radius_status": radius_status,
+                    "center_distance": center_distance,
+                },
+            }
+        )
+    return candidates
+
+
+def _best_existing_model_hole_circle_edge(edges: list[Any], spec: dict[str, Any]) -> dict[str, Any] | None:
+    selector_data = spec.get("edge_selector_data", {})
+    role = str(selector_data.get("role", "hole_diameter")) if isinstance(selector_data, dict) else "hole_diameter"
+    candidates = _existing_model_hole_circle_edge_candidates(edges, role)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            item["radius_status"] != "measured",
+            float(item["radius"]) if item["radius_status"] == "measured" else float("inf"),
+            float(item["center_distance"]),
+        )
+    )
+    best = candidates[0]
+    best["summary"]["candidate_count"] = len(candidates)
+    return {"edge": best["edge"], "summary": best["summary"]}
+
+
+def _best_existing_model_fillet_arc_edge(edges: list[Any], spec: dict[str, Any]) -> dict[str, Any] | None:
+    selector_data = spec.get("edge_selector_data", {})
+    role = str(selector_data.get("role", "chamfer_radius")) if isinstance(selector_data, dict) else "chamfer_radius"
+    candidates: list[dict[str, Any]] = []
+    for edge in edges:
+        arc = _arc_summary_from_curve_params(_edge_curve_params(edge))
+        if arc is None or not arc.get("is_arc"):
+            continue
+        radius = float(arc.get("radius") or 0.0)
+        if radius <= 0:
+            continue
+        center_distance = _point_distance(arc["center"], (0.0, 0.0, 0.0))
+        candidates.append(
+            {
+                "edge": edge,
+                "radius": radius,
+                "center_distance": center_distance,
+                "summary": {
+                    "role": role,
+                    "center": list(arc["center"]),
+                    "radius": radius,
+                    "start_angle": arc["start_angle"],
+                    "end_angle": arc["end_angle"],
+                    "center_distance": center_distance,
+                },
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (float(item["radius"]), float(item["center_distance"])))
+    best = candidates[0]
+    best["summary"]["candidate_count"] = len(candidates)
+    return {"edge": best["edge"], "summary": best["summary"]}
+
+
+def _best_existing_model_hole_position_edges(edges: list[Any], spec: dict[str, Any]) -> list[dict[str, Any]] | None:
+    selector_data = spec.get("edge_selector_data", {})
+    role = str(selector_data.get("role", "hole_position_x")) if isinstance(selector_data, dict) else "hole_position_x"
+    axis = "y" if role == "hole_position_y" else "x"
+    hole = _best_existing_model_hole_circle_edge(edges, {"edge_selector_data": {"role": f"{role}_hole"}})
+    if hole is None:
+        return None
+
+    datum_candidates: list[dict[str, Any]] = []
+    for edge in edges:
+        line = _line_summary_from_curve_params(_edge_curve_params(edge))
+        if line is None:
+            continue
+        start = line["start"]
+        end = line["end"]
+        dx = abs(end[0] - start[0])
+        dy = abs(end[1] - start[1])
+        dz = abs(end[2] - start[2])
+        if axis == "x":
+            axis_mid = (start[0] + end[0]) / 2.0
+            perpendicular_length = max(dy, dz)
+            axis_span = dx
+        else:
+            axis_mid = (start[1] + end[1]) / 2.0
+            perpendicular_length = max(dx, dz)
+            axis_span = dy
+        if perpendicular_length <= max(axis_span * 1.5, 0.0005):
+            continue
+        datum_candidates.append(
+            {
+                "edge": edge,
+                "axis_mid": axis_mid,
+                "summary": {
+                    "role": f"{role}_datum",
+                    "axis": axis,
+                    "start": list(start),
+                    "end": list(end),
+                    "axis_mid": axis_mid,
+                    "axis_span": axis_span,
+                    "perpendicular_length": perpendicular_length,
+                },
+            }
+        )
+    if not datum_candidates:
+        hole_candidates = _existing_model_hole_circle_edge_candidates(edges, role)
+        if len(hole_candidates) < 2:
+            return None
+        axis_index = 1 if axis == "y" else 0
+        hole_candidates.sort(key=lambda item: float(item["center"][axis_index]))
+        first = hole_candidates[0]
+        second = hole_candidates[-1]
+        if first["edge"] is second["edge"]:
+            return None
+        first["summary"] = {**first["summary"], "role": f"{role}_hole_min", "axis": axis}
+        second["summary"] = {**second["summary"], "role": f"{role}_hole_max", "axis": axis}
+        return [first, second]
+    datum_candidates.sort(key=lambda item: float(item["axis_mid"]))
+    datum = datum_candidates[0]
+    return [datum, hole]
+
+
 def _best_line_edge_for_length(edges: list[Any], spec: dict[str, Any]) -> dict[str, Any] | None:
     """Select the visible straight edge that best matches a requested line length."""
 
@@ -15430,10 +16104,10 @@ def _existing_model_prismatic_dimension_ids() -> list[str]:
     - hole_position_x: 孔位 X 坐标
     - hole_position_y: 孔位 Y 坐标
     - hole_diameter: 孔径
-    - chamfer_radius: 倒角半径
-    
-    overall_length is the hard requirement; other dimensions are best-effort
-    additions that enhance the drawing but won't reject acceptance if they fail.
+
+    Fillet/chamfer radius is attempted as optional evidence when an arc is
+    selectable, but arbitrary imported models do not prove that such a feature
+    exists.
     """
 
     return [
@@ -15443,7 +16117,6 @@ def _existing_model_prismatic_dimension_ids() -> list[str]:
         "hole_position_x",
         "hole_position_y",
         "hole_diameter",
-        "chamfer_radius",
     ]
 
 
@@ -15523,6 +16196,64 @@ def _existing_model_geometry_profile(dimensions: Any) -> dict[str, Any]:
         "draft_classification": "imported_prismatic_machining_draft",
         "reason": "no_near_equal_bbox_axes",
         "matched_axis_ratio": closest_ratio if closest_pair is not None else None,
+    }
+
+
+def _existing_model_axis_dimensions(dimensions: Any) -> dict[str, float]:
+    if not isinstance(dimensions, dict):
+        return {}
+    axis_dimensions: dict[str, float] = {}
+    for axis in ("x", "y", "z"):
+        try:
+            numeric = float(dimensions.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if numeric > 0:
+            axis_dimensions[axis] = numeric
+    return axis_dimensions
+
+
+def _existing_model_prismatic_hole_face_view_names(dimensions: Any) -> list[str]:
+    axis_dimensions = _existing_model_axis_dimensions(dimensions)
+    if not axis_dimensions:
+        return ["*Top", "*上视", "*Front", "*前视", "*Right", "*右视"]
+    thin_axis = min(axis_dimensions.items(), key=lambda item: item[1])[0]
+    if thin_axis == "x":
+        return ["*Right", "*右视", "*Front", "*前视", "*Top", "*上视"]
+    if thin_axis == "y":
+        return ["*Front", "*前视", "*Top", "*上视", "*Right", "*右视"]
+    return ["*Top", "*上视", "*Front", "*前视", "*Right", "*右视"]
+
+
+def _existing_model_prismatic_hole_face_dimensions(dimensions: Any) -> dict[str, Any]:
+    axis_dimensions = _existing_model_axis_dimensions(dimensions)
+    x_dim = max(float(axis_dimensions.get("x") or 0.0), 0.001)
+    y_dim = max(float(axis_dimensions.get("y") or 0.0), 0.001)
+    z_dim = max(float(axis_dimensions.get("z") or 0.0), 0.001)
+    thin_axis = min((("x", x_dim), ("y", y_dim), ("z", z_dim)), key=lambda item: item[1])[0]
+    if thin_axis == "x":
+        return {"width_m": y_dim, "height_m": z_dim, "face_axes": ["y", "z"], "thin_axis": "x"}
+    if thin_axis == "y":
+        return {"width_m": x_dim, "height_m": z_dim, "face_axes": ["x", "z"], "thin_axis": "y"}
+    return {"width_m": x_dim, "height_m": y_dim, "face_axes": ["x", "y"], "thin_axis": "z"}
+
+
+def _existing_model_prismatic_overall_dimension_axes(dimensions: Any) -> dict[str, str]:
+    axis_dimensions = _existing_model_axis_dimensions(dimensions)
+    if len(axis_dimensions) < 3:
+        return {
+            "overall_width": "x",
+            "overall_length": "y",
+            "overall_height": "z",
+        }
+    thin_axis = min(axis_dimensions.items(), key=lambda item: item[1])[0]
+    face_axes = [axis for axis in ("x", "y", "z") if axis != thin_axis]
+    length_axis = max(face_axes, key=lambda axis: axis_dimensions[axis])
+    width_axis = min(face_axes, key=lambda axis: axis_dimensions[axis])
+    return {
+        "overall_width": width_axis,
+        "overall_length": length_axis,
+        "overall_height": thin_axis,
     }
 
 
@@ -15680,50 +16411,78 @@ def _existing_model_overall_dimension_specs(
     model_dimensions = layout.get("model_dimensions_m") if isinstance(layout, dict) else {}
     geo = layout.get("existing_model_geometry_profile", {}) if isinstance(layout, dict) else {}
     is_rotational = geo.get("kind") == "rotational" if isinstance(geo, dict) else False
+    is_prismatic = geo.get("kind") == "prismatic" if isinstance(geo, dict) else False
 
-    model_values = []
+    model_dimensions_by_axis: dict[str, float] = {}
     if isinstance(model_dimensions, dict):
-        for value in model_dimensions.values():
+        for axis in ("x", "y", "z"):
             try:
-                numeric = float(value)
+                numeric = float(model_dimensions.get(axis))
             except (TypeError, ValueError):
                 continue
             if numeric > 0:
-                model_values.append(numeric)
+                model_dimensions_by_axis[axis] = numeric
+    model_values = list(model_dimensions_by_axis.values())
     min_model_dim = min(model_values) if model_values else None
     max_model_dim = max(model_values) if model_values else None
+    sorted_model_axes = sorted(model_dimensions_by_axis.items(), key=lambda item: item[1])
+    min_model_axis = sorted_model_axes[0][0] if sorted_model_axes else None
+    max_model_axis = sorted_model_axes[-1][0] if sorted_model_axes else None
 
     end_outline = _view_outline_for_role("end", views, view_result)
     section_outline = _view_outline_for_role("section", views, view_result)
+    hole_face_outline = _view_outline_for_role("hole_face", views, view_result)
+    flat_pattern_outline = _view_outline_for_role("flat_pattern", views, view_result)
     specs: list[dict[str, Any]] = []
     edge_types = ("EDGE", "SKETCHSEGMENT", "EXTSKETCHSEGMENT", "LINE", "ARC")
 
     # ══════════════════════════════════════════════════════════
     #  FALLBACK: Use original rotational logic (handles all geometry kinds through outline-based edge selection)
     # ══════════════════════════════════════════════════════════
-    if not is_rotational and section_outline is not None:
+    if not is_rotational and not is_prismatic and section_outline is not None:
         left, bottom, right, top = section_outline
         mid_x = (left + right) / 2.0
         mid_y = (bottom + top) / 2.0
         width = right - left
-        specs.append({
-            "id": "overall_length",
-            "view_role": "section",
-            "method": "AddHorizontalDimension2",
-            "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
-            "edge_selector": "existing_model_extreme_edges",
-            "edge_selector_data": {
-                "axis": "x",
-                "expected_length_m": max_model_dim or width,
-                "role": "existing_model_overall_length",
-            },
-            "points": [
-                {"x": left, "y": mid_y, "selection_types": edge_types},
-                {"x": right, "y": mid_y, "selection_types": edge_types},
-            ],
-            "position": {"x": mid_x, "y": top + max(width * 0.20, 0.016)},
-        })
-    else:
+        height = top - bottom
+        length_axis = max_model_axis if max_model_axis in {"x", "y"} else ("y" if height >= width else "x")
+        if length_axis == "y":
+            specs.append({
+                "id": "overall_length",
+                "view_role": "section",
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "y",
+                    "expected_length_m": max_model_dim or height,
+                    "role": "existing_model_overall_length",
+                },
+                "points": [
+                    {"x": mid_x, "y": bottom, "selection_types": edge_types},
+                    {"x": mid_x, "y": top, "selection_types": edge_types},
+                ],
+                "position": {"x": right + max(height * 0.20, 0.016), "y": mid_y},
+            })
+        else:
+            specs.append({
+                "id": "overall_length",
+                "view_role": "section",
+                "method": "AddHorizontalDimension2",
+                "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "x",
+                    "expected_length_m": max_model_dim or width,
+                    "role": "existing_model_overall_length",
+                },
+                "points": [
+                    {"x": left, "y": mid_y, "selection_types": edge_types},
+                    {"x": right, "y": mid_y, "selection_types": edge_types},
+                ],
+                "position": {"x": mid_x, "y": top + max(width * 0.20, 0.016)},
+            })
+    elif not is_prismatic:
         length_outline = section_outline or end_outline
         length_role = "section" if section_outline is not None else "end"
         if length_outline is not None:
@@ -15751,8 +16510,96 @@ def _existing_model_overall_dimension_specs(
 
     # For non-rotational parts: add comprehensive dimension specs
     if not is_rotational:
+        if is_prismatic:
+            hole_face_dimensions = layout.get("hole_face_dimensions") if isinstance(layout, dict) else None
+            if not isinstance(hole_face_dimensions, dict):
+                hole_face_dimensions = _existing_model_prismatic_hole_face_dimensions(model_dimensions)
+            face_axes_raw = hole_face_dimensions.get("face_axes") if isinstance(hole_face_dimensions, dict) else None
+            face_axes = [
+                str(axis)
+                for axis in face_axes_raw
+                if axis in {"x", "y", "z"}
+            ] if isinstance(face_axes_raw, list) else []
+            if hole_face_outline is not None and isinstance(model_dimensions, dict) and len(face_axes) == 2:
+                axis_values: list[tuple[str, float]] = []
+                for axis in face_axes:
+                    try:
+                        axis_values.append((axis, float(model_dimensions[axis])))
+                    except (KeyError, TypeError, ValueError):
+                        axis_values.append((axis, 0.0))
+                if all(value > 0.0 for _axis, value in axis_values):
+                    length_axis = max(axis_values, key=lambda item: item[1])[0]
+                    h_left, h_bottom, h_right, h_top = hole_face_outline
+                    h_width = h_right - h_left
+                    h_height = h_top - h_bottom
+                    h_mid_x = (h_left + h_right) / 2.0
+                    h_mid_y = (h_bottom + h_top) / 2.0
+                    horizontal_id = "overall_length" if face_axes[0] == length_axis else "overall_width"
+                    vertical_id = "overall_length" if face_axes[1] == length_axis else "overall_width"
+                    specs.append({
+                        "id": horizontal_id,
+                        "view_role": "hole_face",
+                        "method": "AddHorizontalDimension2",
+                        "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
+                        "edge_selector": "existing_model_extreme_edges",
+                        "edge_selector_data": {
+                            "axis": face_axes[0],
+                            "expected_length_m": float(model_dimensions[face_axes[0]]),
+                            "role": f"existing_model_{horizontal_id}",
+                        },
+                        "points": [
+                            {"x": h_left, "y": h_mid_y, "selection_types": edge_types},
+                            {"x": h_right, "y": h_mid_y, "selection_types": edge_types},
+                        ],
+                        "position": {"x": h_mid_x, "y": h_bottom - max(h_height * 0.10, 0.014)},
+                        "minimum_selections": 1,
+                    })
+                    specs.append({
+                        "id": vertical_id,
+                        "view_role": "hole_face",
+                        "method": "AddVerticalDimension2",
+                        "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                        "edge_selector": "existing_model_extreme_edges",
+                        "edge_selector_data": {
+                            "axis": face_axes[1],
+                            "expected_length_m": float(model_dimensions[face_axes[1]]),
+                            "role": f"existing_model_{vertical_id}",
+                        },
+                        "points": [
+                            {"x": h_mid_x, "y": h_bottom, "selection_types": edge_types},
+                            {"x": h_mid_x, "y": h_top, "selection_types": edge_types},
+                        ],
+                        "position": {"x": h_right + max(h_width * 0.20, 0.014), "y": h_mid_y},
+                        "minimum_selections": 1,
+                    })
+            thin_axis = str(hole_face_dimensions.get("thin_axis") or min_model_axis or "") if isinstance(hole_face_dimensions, dict) else str(min_model_axis or "")
+            thickness_outline = end_outline or section_outline
+            thickness_role = "end" if end_outline is not None else "section"
+            if thin_axis in {"x", "y", "z"} and thickness_outline is not None:
+                t_left, t_bottom, t_right, t_top = thickness_outline
+                t_height = t_top - t_bottom
+                t_mid_x = (t_left + t_right) / 2.0
+                t_mid_y = (t_bottom + t_top) / 2.0
+                specs.append({
+                    "id": "overall_height",
+                    "view_role": thickness_role,
+                    "method": "AddVerticalDimension2",
+                    "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                    "edge_selector": "existing_model_extreme_edges",
+                    "edge_selector_data": {
+                        "axis": thin_axis,
+                        "expected_length_m": float(model_dimensions_by_axis.get(thin_axis) or min_model_dim or t_height),
+                        "role": "existing_model_overall_height",
+                    },
+                    "points": [
+                        {"x": t_mid_x, "y": t_bottom, "selection_types": edge_types},
+                        {"x": t_mid_x, "y": t_top, "selection_types": edge_types},
+                    ],
+                    "position": {"x": t_right + max(t_height * 0.20, 0.014), "y": t_mid_y},
+                    "minimum_selections": 1,
+                })
         # overall_width (width dimension on front/top view)
-        if end_outline is not None:
+        if not is_prismatic and end_outline is not None:
             e_left, e_bottom, e_right, e_top = end_outline
             e_width = e_right - e_left
             e_mid_x = (e_left + e_right) / 2.0
@@ -15772,8 +16619,30 @@ def _existing_model_overall_dimension_specs(
                 "minimum_selections": 1,
             })
 
-        # overall_height (height dimension on section view)
-        if section_outline is not None:
+        if not is_prismatic and end_outline is not None and min_model_axis == "z":
+            e_left, e_bottom, e_right, e_top = end_outline
+            e_height = e_top - e_bottom
+            e_mid_x = (e_left + e_right) / 2.0
+            e_mid_y = (e_bottom + e_top) / 2.0
+            specs.append({
+                "id": "overall_height",
+                "view_role": "end",
+                "method": "AddVerticalDimension2",
+                "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
+                "edge_selector": "existing_model_extreme_edges",
+                "edge_selector_data": {
+                    "axis": "z",
+                    "expected_length_m": min_model_dim or e_height,
+                    "role": "existing_model_overall_height",
+                },
+                "points": [
+                    {"x": e_mid_x, "y": e_bottom, "selection_types": edge_types},
+                    {"x": e_mid_x, "y": e_top, "selection_types": edge_types},
+                ],
+                "position": {"x": e_right + max(e_height * 0.20, 0.014), "y": e_mid_y},
+                "minimum_selections": 1,
+            })
+        if not is_prismatic and section_outline is not None:
             s_left, s_bottom, s_right, s_top = section_outline
             s_width = s_right - s_left
             s_mid_x = (s_left + s_right) / 2.0
@@ -15793,57 +16662,68 @@ def _existing_model_overall_dimension_specs(
                 "minimum_selections": 1,
             })
 
-        # hole_position_x and hole_position_y (for hole location dimensions)
-        if section_outline is not None:
+        hole_view_outlines = [
+            (role, outline)
+            for role, outline in (
+                ("hole_face", hole_face_outline),
+                ("flat_pattern", flat_pattern_outline),
+                ("end", end_outline),
+                ("section", section_outline),
+            )
+            if outline is not None
+        ]
+        for hole_view_role, hole_outline in hole_view_outlines:
+            h_left, h_bottom, h_right, h_top = hole_outline
+            h_width = h_right - h_left
+            h_height = h_top - h_bottom
+            h_mid_x = (h_left + h_right) / 2.0
+            h_mid_y = (h_bottom + h_top) / 2.0
             specs.append({
                 "id": "hole_position_x",
-                "view_role": "section",
+                "view_role": hole_view_role,
                 "method": "AddHorizontalDimension2",
                 "fallback_methods": ["AddVerticalDimension2", "AddDimension2"],
                 "edge_selector": "hole_edge",
                 "edge_selector_data": {"role": "hole_position_x"},
                 "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
-                "position": {"x": 0, "y": 0},
-                "minimum_selections": 0,
+                "position": {"x": h_mid_x, "y": h_bottom - max(h_height * 0.10, 0.014)},
+                "minimum_selections": 2,
             })
             specs.append({
                 "id": "hole_position_y",
-                "view_role": "section",
+                "view_role": hole_view_role,
                 "method": "AddVerticalDimension2",
                 "fallback_methods": ["AddHorizontalDimension2", "AddDimension2"],
                 "edge_selector": "hole_edge",
                 "edge_selector_data": {"role": "hole_position_y"},
                 "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
-                "position": {"x": 0, "y": 0},
-                "minimum_selections": 0,
+                "position": {"x": h_right + max(h_width * 0.20, 0.014), "y": h_mid_y},
+                "minimum_selections": 2,
             })
-
-        # hole_diameter (for diameter dimensions)
-        if section_outline is not None:
             specs.append({
                 "id": "hole_diameter",
-                "view_role": "section",
+                "view_role": hole_view_role,
                 "method": "AddDimension2",
                 "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2"],
                 "edge_selector": "hole_edge",
                 "edge_selector_data": {"role": "hole_diameter"},
                 "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
-                "position": {"x": 0, "y": 0},
-                "minimum_selections": 0,
+                "position": {"x": h_right + max(h_width * 0.20, 0.014), "y": h_top},
+                "minimum_selections": 1,
             })
-
-        # chamfer_radius (for fillet/chamfer radius dimensions)
-        if section_outline is not None:
             specs.append({
                 "id": "chamfer_radius",
-                "view_role": "section",
+                "view_role": hole_view_role,
                 "method": "AddDimension2",
                 "fallback_methods": ["AddVerticalDimension2", "AddHorizontalDimension2"],
                 "edge_selector": "fillet_edge",
                 "edge_selector_data": {"role": "chamfer_radius"},
                 "points": [{"x": 0, "y": 0, "selection_types": edge_types}],
-                "position": {"x": 0, "y": 0},
-                "minimum_selections": 0,
+                "position": {
+                    "x": h_right + max(h_width * 0.20, 0.014),
+                    "y": h_top - max(h_height * 0.10, 0.014),
+                },
+                "minimum_selections": 1,
             })
 
     return specs
@@ -15982,6 +16862,51 @@ def _existing_model_assembly_note_dimension_items(
     return items
 
 
+def _existing_model_prismatic_note_dimension_items(
+    missing_dimensions: list[str],
+    view_result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    layout = view_result.get("layout") if isinstance(view_result, dict) else {}
+    if not isinstance(layout, dict):
+        return []
+    model_dimensions_mm = layout.get("model_dimensions_mm")
+    if not isinstance(model_dimensions_mm, dict):
+        model_dimensions_m = layout.get("model_dimensions_m")
+        if not isinstance(model_dimensions_m, dict):
+            return []
+        model_dimensions_mm = {}
+        for axis in ("x", "y", "z"):
+            try:
+                model_dimensions_mm[axis] = float(model_dimensions_m.get(axis) or 0.0) * 1000.0
+            except (TypeError, ValueError):
+                model_dimensions_mm[axis] = 0.0
+    axis_by_id = _existing_model_prismatic_overall_dimension_axes(model_dimensions_mm)
+    items: list[dict[str, Any]] = []
+    for dimension_id in missing_dimensions:
+        axis = axis_by_id.get(str(dimension_id))
+        if axis is None:
+            continue
+        try:
+            value_mm = float(model_dimensions_mm.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            value_mm = 0.0
+        if value_mm <= 0:
+            continue
+        items.append(
+            {
+                "id": str(dimension_id),
+                "method": "model_bbox_readback_note",
+                "is_display_dimension": False,
+                "classification": "geometry_readback_note",
+                "annotation_kind": "imported_prismatic_overall_size_note",
+                "proxy_dimension": False,
+                "value_mm": round(value_mm, 3),
+                "axis": axis,
+            }
+        )
+    return items
+
+
 def _positive_model_dimension(model_dimensions: Any, axis: str) -> float:
     """Return a positive model dimension in meters, or zero when unavailable."""
 
@@ -16009,6 +16934,138 @@ def _existing_model_bbox_sketch_dimension_specs(view_result: dict[str, Any]) -> 
         return []
     scale_is_trusted = abs(scale - 1.0) <= 0.001
     specs: list[dict[str, Any]] = []
+
+    geometry_profile = layout.get("existing_model_geometry_profile")
+    hole_face = slots.get("hole_face") if isinstance(slots.get("hole_face"), dict) else None
+    hole_face_dimensions = layout.get("hole_face_dimensions")
+    model_dimensions = layout.get("model_dimensions_m")
+    if (
+        isinstance(geometry_profile, dict)
+        and geometry_profile.get("kind") == "prismatic"
+        and isinstance(hole_face, dict)
+        and isinstance(hole_face_dimensions, dict)
+        and isinstance(model_dimensions, dict)
+    ):
+        face_axes_raw = hole_face_dimensions.get("face_axes")
+        face_axes = [
+            str(axis)
+            for axis in face_axes_raw
+            if axis in {"x", "y", "z"}
+        ] if isinstance(face_axes_raw, list) else []
+        axis_values: list[tuple[str, float]] = []
+        for axis in face_axes[:2]:
+            try:
+                axis_values.append((axis, float(model_dimensions[axis])))
+            except (KeyError, TypeError, ValueError):
+                axis_values.append((axis, 0.0))
+        if len(axis_values) == 2 and all(value > 0.0 for _axis, value in axis_values):
+            length_axis = max(axis_values, key=lambda item: item[1])[0]
+            try:
+                cx = float(hole_face["x"])
+                cy = float(hole_face["y"])
+                width = float(hole_face["width_m"]) * scale
+                height = float(hole_face["height_m"]) * scale
+            except (KeyError, TypeError, ValueError):
+                width = height = 0.0
+            if width > 0.0 and height > 0.0:
+                left = cx - width / 2.0
+                right = cx + width / 2.0
+                bottom = cy - height / 2.0
+                top_y = cy + height / 2.0
+                lower_extension_y = bottom - 0.010
+                horizontal_id = "overall_length" if face_axes[0] == length_axis else "overall_width"
+                vertical_id = "overall_length" if face_axes[1] == length_axis else "overall_width"
+                specs.append(
+                    {
+                        "id": horizontal_id,
+                        "view_role": "hole_face",
+                        "method": "AddHorizontalDimension2",
+                        "fallback_methods": ["AddDimension2"],
+                        "scale_is_trusted": scale_is_trusted,
+                        "edge_selector_data": {
+                            "axis": face_axes[0],
+                            "role": horizontal_id,
+                            "expected_length_m": float(model_dimensions[face_axes[0]]),
+                        },
+                        "lines": [
+                            {"start": [left, lower_extension_y], "end": [left, bottom - 0.002]},
+                            {"start": [right, lower_extension_y], "end": [right, bottom - 0.002]},
+                        ],
+                        "points": [
+                            {"x": left, "y": bottom - 0.002},
+                            {"x": right, "y": bottom - 0.002},
+                        ],
+                        "position": {"x": cx, "y": lower_extension_y - 0.006},
+                    }
+                )
+                right_extension_x = right + 0.010
+                specs.append(
+                    {
+                        "id": vertical_id,
+                        "view_role": "hole_face",
+                        "method": "AddVerticalDimension2",
+                        "fallback_methods": ["AddDimension2"],
+                        "scale_is_trusted": scale_is_trusted,
+                        "edge_selector_data": {
+                            "axis": face_axes[1],
+                            "role": vertical_id,
+                            "expected_length_m": float(model_dimensions[face_axes[1]]),
+                        },
+                        "lines": [
+                            {"start": [right + 0.002, bottom], "end": [right_extension_x, bottom]},
+                            {"start": [right + 0.002, top_y], "end": [right_extension_x, top_y]},
+                        ],
+                        "points": [
+                            {"x": right + 0.002, "y": bottom},
+                            {"x": right + 0.002, "y": top_y},
+                        ],
+                        "position": {"x": right_extension_x + 0.006, "y": cy},
+                    }
+                )
+        thin_axis = str(hole_face_dimensions.get("thin_axis") or "")
+        end_slot = slots.get("end") if isinstance(slots.get("end"), dict) else None
+        if end_slot is None:
+            end_slot = slots.get("section") if isinstance(slots.get("section"), dict) else None
+        if thin_axis in {"x", "y", "z"} and isinstance(end_slot, dict):
+            try:
+                thin_dimension = float(model_dimensions[thin_axis]) * scale
+                cx = float(end_slot["x"])
+                cy = float(end_slot["y"])
+                slot_width = float(end_slot.get("width_m") or thin_dimension) * scale
+            except (KeyError, TypeError, ValueError):
+                thin_dimension = 0.0
+                slot_width = 0.0
+            if thin_dimension > 0.0:
+                right = cx + max(slot_width, thin_dimension, 0.010) / 2.0
+                bottom = cy - thin_dimension / 2.0
+                top_y = cy + thin_dimension / 2.0
+                right_extension_x = right + 0.010
+                specs.append(
+                    {
+                        "id": "overall_height",
+                        "view_role": "end" if "end" in slots else "section",
+                        "method": "AddVerticalDimension2",
+                        "fallback_methods": ["AddDimension2"],
+                        "scale_is_trusted": scale_is_trusted,
+                        "edge_selector_data": {
+                            "axis": thin_axis,
+                            "role": "overall_height",
+                            "expected_length_m": float(model_dimensions[thin_axis]),
+                        },
+                        "lines": [
+                            {"start": [right + 0.002, bottom], "end": [right_extension_x, bottom]},
+                            {"start": [right + 0.002, top_y], "end": [right_extension_x, top_y]},
+                        ],
+                        "points": [
+                            {"x": right + 0.002, "y": bottom},
+                            {"x": right + 0.002, "y": top_y},
+                        ],
+                        "position": {"x": right_extension_x + 0.006, "y": cy},
+                    }
+                )
+        if specs:
+            return specs
+
     front = slots.get("front") if isinstance(slots.get("front"), dict) else None
     top = slots.get("top") if isinstance(slots.get("top"), dict) else None
     if front is not None:

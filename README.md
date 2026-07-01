@@ -55,11 +55,15 @@ SolidWorks 文档前，仍必须由调用方提交 `confirmed=true`。
 
 该路径会把源模型复制到隔离的 `run_dir`，只生成新的零件和工程图文件，不会
 原地修改用户文件。生产验收要求真实 SolidWorks 剖视图
-`CreateSectionViewAt5` 证据、主剖视图、端视图、等轴测参考图、OD/ID/L
-三类几何可验证 display dimensions、中心线/中心标记、A3 第一角法布局、
-PDF/DWG/SLDDRW 导出，以及“导入模型尺寸/材料/表面处理需人工确认”的可见
-技术说明。导入模型不会伪造完整加工尺寸；未能从模型或用户输入确认的信息会
-明确标记为 `<未指定>` 或需人工确认。
+`CreateSectionViewAt5` 证据、主剖视图、端视图、等轴测参考图、A3 第一角法
+布局、PDF/DWG/SLDDRW 导出，以及“导入模型尺寸/材料/表面处理需人工确认”的
+可见技术说明。旋转类导入件仍要求 OD/ID/L 三类几何可验证 display
+dimensions；棱柱类导入件允许整体长/宽/高由模型包围盒读回生成
+`geometry_readback_note` 证据，且 note 的轴和值必须与
+`model_geometry_result.measured_dimensions_mm` 中的 verified 几何读回匹配；
+孔位 X/Y 和孔径仍必须是真实 SolidWorks display dimensions。导入模型不会
+伪造完整加工尺寸；未能从模型或用户输入确认的信息会明确标记为 `<未指定>` 或需
+人工确认。
 
 常用中文验收命令：
 
@@ -673,6 +677,18 @@ plus `artifacts.json`.  It also verifies `environment.json` and reports
 captured adapter env agree with the report; accepted real SolidWorks runs must
 also prove `SOLIDWORKS_MCP_CLOSE_DOCUMENTS_AFTER_RUN` and
 `SOLIDWORKS_MCP_REQUIRE_DIRECT_HOLE_CALLOUT` were enabled.
+
+For imported prismatic model drawings, `acceptance_summary.required_dimensions`
+lists both readback-note and display-dimension requirements.  The stricter
+`required_display_dimensions` subset names the dimensions that must be real
+SolidWorks display dimensions; overall length/width/height may be accepted as
+`geometry_readback_note` entries only when they are model-bounding-box readback
+notes whose axis and `value_mm` match
+`model_geometry_result.measured_dimensions_mm`, not proxy dimensions.  The
+optional construction-reference dimension fallback is disabled by default with
+`SOLIDWORKS_MCP_ENABLE_CONSTRUCTION_REFERENCE_DIMENSIONS=0` because real
+SolidWorks can hang while creating drawing reference dimensions.  Set it to `1`
+only for supervised diagnosis runs where that risk is acceptable.
 For release handoff review, `diagnose_runs` and `scripts/diagnose_runs.py`
 batch-audit all discovered run directories below a root, returning accepted and
 rejected counts plus `issue_counts` grouped by production, artifact, event,

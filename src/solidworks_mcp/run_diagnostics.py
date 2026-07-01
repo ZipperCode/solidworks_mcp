@@ -625,6 +625,120 @@ def _basic_dimension_evidence_ok(diagnostics: Any) -> bool:
     )
 
 
+PRISMATIC_OVERALL_DIMENSION_IDS = frozenset({"overall_length", "overall_width", "overall_height"})
+PRISMATIC_REQUIRED_DIMENSION_IDS = frozenset(
+    {
+        "overall_length",
+        "overall_width",
+        "overall_height",
+        "hole_position_x",
+        "hole_position_y",
+        "hole_diameter",
+    }
+)
+
+
+def _prismatic_required_display_dimension_ids(required_ids: set[str]) -> set[str]:
+    return required_ids - PRISMATIC_OVERALL_DIMENSION_IDS
+
+
+def _prismatic_overall_axis_map(geometry_result: dict[str, Any]) -> dict[str, str]:
+    measured = geometry_result.get("measured_dimensions_mm")
+    if not isinstance(measured, dict):
+        return {}
+    axis_dimensions: dict[str, float] = {}
+    for axis in ("x", "y", "z"):
+        try:
+            value = float(measured.get(axis) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0.0:
+            axis_dimensions[axis] = value
+    if len(axis_dimensions) != 3:
+        return {}
+    height_axis = min(axis_dimensions, key=axis_dimensions.__getitem__)
+    face_axes = [axis for axis in ("x", "y", "z") if axis != height_axis]
+    length_axis = max(face_axes, key=axis_dimensions.__getitem__)
+    width_axis = min(face_axes, key=axis_dimensions.__getitem__)
+    return {
+        "overall_length": length_axis,
+        "overall_width": width_axis,
+        "overall_height": height_axis,
+    }
+
+
+def _prismatic_readback_note_matches_geometry(
+    item: dict[str, Any],
+    dimension_id: str,
+    geometry_result: dict[str, Any],
+) -> bool:
+    if geometry_result.get("status") != "geometry_verified":
+        return False
+    measured = geometry_result.get("measured_dimensions_mm")
+    if not isinstance(measured, dict):
+        return False
+    axis_by_id = _prismatic_overall_axis_map(geometry_result)
+    axis = axis_by_id.get(dimension_id)
+    if axis is None or item.get("axis") != axis:
+        return False
+    try:
+        measured_value = float(measured.get(axis) or 0.0)
+        note_value = float(item.get("value_mm") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return measured_value > 0.0 and abs(measured_value - note_value) <= 0.01
+
+
+def _prismatic_dimension_item_ok(
+    item: dict[str, Any],
+    dimension_id: str,
+    geometry_result: dict[str, Any],
+) -> bool:
+    if item.get("proxy_dimension") is True:
+        return False
+    if dimension_id in PRISMATIC_OVERALL_DIMENSION_IDS:
+        if item.get("classification") == "geometry_verified_dimension":
+            return item.get("is_display_dimension") is True
+        return (
+            item.get("classification") == "geometry_readback_note"
+            and item.get("annotation_kind") == "imported_prismatic_overall_size_note"
+            and _prismatic_readback_note_matches_geometry(item, dimension_id, geometry_result)
+        )
+    return item.get("classification") == "geometry_verified_dimension" and item.get("is_display_dimension") is True
+
+
+def _prismatic_dimension_evidence_ok(
+    diagnostics: dict[str, Any],
+    result: dict[str, Any],
+    created: list[dict[str, Any]],
+    required_ids: set[str],
+    display_count: int,
+    geometry_count: int,
+) -> bool:
+    draft = _manufacturing_draft_result(diagnostics)
+    if draft.get("classification") != "imported_prismatic_machining_draft":
+        return False
+    created_by_id = {str(item.get("id")): item for item in created if item.get("id")}
+    required_display_ids = _prismatic_required_display_dimension_ids(required_ids)
+    geometry_result = _as_dict(diagnostics.get("model_geometry_result"))
+    trusted_geometry_evidence_count = sum(
+        1
+        for dimension_id in required_ids
+        if dimension_id in created_by_id
+        and _prismatic_dimension_item_ok(created_by_id[dimension_id], dimension_id, geometry_result)
+    )
+    return (
+        _basic_dimension_evidence_ok(diagnostics)
+        and required_ids.issubset(set(created_by_id))
+        and all(
+            _prismatic_dimension_item_ok(created_by_id[dimension_id], dimension_id, geometry_result)
+            for dimension_id in required_ids
+        )
+        and display_count >= len(required_display_ids)
+        and max(geometry_count, trusted_geometry_evidence_count) >= len(required_ids)
+    )
+
+
 def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
     """Return whether dimensions are real SolidWorks display dimensions, not proxy layout."""
 
@@ -657,6 +771,16 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
                 if item.get("classification") == "geometry_verified_dimension"
                 and item.get("proxy_dimension") is not True
             )
+        draft = _manufacturing_draft_result(diagnostics)
+        if draft.get("classification") == "imported_prismatic_machining_draft":
+            return _prismatic_dimension_evidence_ok(
+                diagnostics,
+                result,
+                created,
+                required_ids,
+                display_count,
+                geometry_count,
+            ) and not proxy_dimensions
         return (
             _basic_dimension_evidence_ok(diagnostics)
             and required_ids.issubset(created_ids)
@@ -674,7 +798,7 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
         if not required_ids:
             draft = _manufacturing_draft_result(diagnostics)
             required_ids = (
-                {"overall_length"}
+                set(PRISMATIC_REQUIRED_DIMENSION_IDS)
                 if draft.get("classification") == "imported_prismatic_machining_draft"
                 else {"overall_outer_diameter", "inner_diameter", "overall_length"}
             )
@@ -687,6 +811,16 @@ def _trusted_dimension_evidence_ok(diagnostics: Any) -> bool:
                 if item.get("classification") == "geometry_verified_dimension"
                 and item.get("proxy_dimension") is not True
             )
+        draft = _manufacturing_draft_result(diagnostics)
+        if draft.get("classification") == "imported_prismatic_machining_draft":
+            return _prismatic_dimension_evidence_ok(
+                diagnostics,
+                result,
+                created,
+                required_ids,
+                display_count,
+                geometry_count,
+            ) and not proxy_dimensions
         return (
             _basic_dimension_evidence_ok(diagnostics)
             and required_ids.issubset(created_ids)

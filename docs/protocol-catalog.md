@@ -145,7 +145,7 @@ Prompt：
 当前可用：
 
 - `drawing.standard_views`：创建前/上/右/等轴测视图；生产验收要求 `drawing_view_status=created` 且 `drawing_view_result.views` 覆盖 `front/top/right/isometric` 四个角色。
-- `drawing.basic_dimensions`：创建真实 SolidWorks display dimensions，覆盖 MVP 安装板 `120` 长、`80` 宽、`10` 厚、真实选边径向 `R5/R6` 圆角和 `15/18` 孔边距定位；也覆盖中心孔法兰外径、内孔径和厚度，以及中心孔板长、宽、厚、孔径。`radius_proxy_used` 或任何 `proxy_dimension=true` 只保留为失败诊断，不满足 production acceptance。
+- `drawing.basic_dimensions`：创建真实 SolidWorks display dimensions，覆盖 MVP 安装板 `120` 长、`80` 宽、`10` 厚、真实选边径向 `R5/R6` 圆角和 `15/18` 孔边距定位；也覆盖中心孔法兰外径、内孔径和厚度，以及中心孔板长、宽、厚、孔径。导入旋转件仍要求 OD/ID/L 三类 display dimensions；导入棱柱件允许整体长/宽/高用 `classification=geometry_readback_note`、`annotation_kind=imported_prismatic_overall_size_note` 的模型包围盒读回 note 满足几何证据，但 note 的 `axis` 和 `value_mm` 必须匹配 `model_geometry_result.measured_dimensions_mm`，孔位 X/Y 和孔径仍必须是真实 display dimensions，并通过 `required_display_dimensions` 暴露给诊断客户端。`SOLIDWORKS_MCP_ENABLE_CONSTRUCTION_REFERENCE_DIMENSIONS=0` 是默认挂起保护，会跳过构造参考尺寸 fallback 并记录 `skipped_hang_guard`；只有受控诊断时才应设为 `1`。`radius_proxy_used` 或任何 `proxy_dimension=true` 只保留为失败诊断，不满足 production acceptance。
 - `drawing.metadata_note`：当计划请求 `set_custom_properties` 时，把已验证属性值插入图纸可见 note；PDF 语义验证要求这些值出现在导出的 PDF 文本中。
 - `drawing.hole_callouts`：从孔面正投影视图选择可见孔边并调用 `AddHoleCallout2` 创建真实 Hole Callout。Hole Table 只能作为诊断 fallback，不满足 smoke acceptance。
 

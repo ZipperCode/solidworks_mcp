@@ -641,6 +641,11 @@ def _validate_existing_model_fields(parameters: dict[str, Any], index: int) -> N
     copy_to_run_dir = parameters.get("copy_to_run_dir", True)
     if not isinstance(copy_to_run_dir, bool):
         raise PlanValidationError(f"operations[{index}].parameters.copy_to_run_dir must be boolean when provided")
+    if copy_to_run_dir is not True:
+        raise PlanValidationError(
+            f"operations[{index}].parameters.copy_to_run_dir must be true; "
+            "existing models are always copied into the isolated run directory before execution"
+        )
 
     reference_search_paths = parameters.get("reference_search_paths", [])
     if reference_search_paths is None:
